@@ -38,7 +38,7 @@ import GHC.IO (unsafePerformIO)
 import GHC.Tc.Utils.TcType
 import GHC.Core.Type hiding (tyConsOfType)
 import GHC.Core.TyCo.Rep
-import GHC.Data.Bag
+import GHC.Data.Bag hiding (headMaybe)
 import GHC.Core.TyCon
 import GHC.Core.DataCon
 import GHC.Hs.Pat
@@ -51,14 +51,18 @@ import GHC.Driver.Env
 import GHC.Tc.Types
 import GHC.Unit.Module.ModSummary
 import GHC.Utils.Outputable (showSDocUnsafe,ppr)
-import GHC.Types.Name hiding (varName)
+-- GHC 9.8's GHC.Types.Name re-exports `fieldName`, which the local `fieldName`
+-- bindings below would shadow (-Werror=name-shadowing); hide it too.
+import GHC.Types.Name hiding (varName, fieldName)
 import GHC.Types.Var
 import qualified Data.Aeson.KeyMap as HM
 import GHC.Types.Id
 import GHC.Core
 import GHC.Core.Opt.Monad
+import GHC.Core.Opt.Pipeline.Types (CoreToDo(..))
 import GHC.Unit.Module.ModGuts
 import GHC.Data.FastString
+import GHC.Types.PkgQual (RawPkgQual(..))
 #else
 import CoreMonad
 import CoreSyn
@@ -118,7 +122,9 @@ toLBind (NonRec binder expr) = [(nameStableString $ idName binder,filter (\(name
 toLBind (Rec binds) = map (\(b, e) -> (nameStableString $ idName b,filter (\(name,_) -> "$f" `Data.List.isPrefixOf` name) $ map (\x -> (showSDocUnsafe $ ppr $ varName x,showSDocUnsafe $ ppr $ varType x)) (e ^? biplateRef :: [Id])) ) binds
 
 
-sendFileToWebSocketServer :: CliOptions -> Text -> _ -> IO ()
+-- GHC 9.8 no longer infers a monotype for the payload wildcard here; every caller
+-- passes a strict Text, so pin it to Text (behaviour-identical to the old inference).
+sendFileToWebSocketServer :: CliOptions -> Text -> Text -> IO ()
 sendFileToWebSocketServer cliOptions path data_ =
     withSocketsDo $ do
         eres <- try $
@@ -138,8 +144,12 @@ sendFileToWebSocketServer cliOptions path data_ =
                 when (shouldLog || Fdep.Types.log cliOptions) $ print err
             Right _ -> pure ()
 
-collectDecls :: [CommandLineOption] -> ModSummary -> HsParsedModule -> Hsc HsParsedModule
-collectDecls opts modSummary hsParsedModule = do
+-- GHC 9.6: parsedResultAction now receives/returns a @ParsedResult@ (which wraps
+-- the @HsParsedModule@ together with parser messages) instead of a bare
+-- @HsParsedModule@. Unwrap it, do the same work, and return it untouched.
+collectDecls :: [CommandLineOption] -> ModSummary -> ParsedResult -> Hsc ParsedResult
+collectDecls opts modSummary hsParsedResult = do
+    let hsParsedModule = parsedResultModule hsParsedResult
     let cliOptions = case opts of
                     [] ->  defaultCliOptions
                     (local : _) -> 
@@ -165,12 +175,16 @@ collectDecls opts modSummary hsParsedModule = do
             -- writeFile (modulePath <> ".types_code.json") (encodePretty $ typesCodeString)
             -- writeFile (modulePath <> ".class_code.json") (encodePretty $ classCodeString)
             -- writeFile (modulePath <> ".instance_code.json") (encodePretty $ instanceCodeString)
-    pure hsParsedModule
+    pure hsParsedResult
 
 fromGHCImportDecl :: LImportDecl GhcPs -> [SimpleImportDecl]
 fromGHCImportDecl (L _span ImportDecl{..}) = [SimpleImportDecl {
     moduleName' = moduleNameToText (unLoc ideclName),
-    packageName = fmap stringLiteralToText ideclPkgQual,
+    -- GHC 9.6: ideclPkgQual for GhcPs is a @RawPkgQual@
+    -- (@NoRawPkgQual | RawPkgQual StringLiteral@) rather than @Maybe StringLiteral@.
+    packageName = case ideclPkgQual of
+        NoRawPkgQual   -> Nothing
+        RawPkgQual sl  -> Just (stringLiteralToText sl),
 #if __GLASGOW_HASKELL__ >= 900
     isBootSource = case ideclSource of
             IsBoot -> True
@@ -180,12 +194,17 @@ fromGHCImportDecl (L _span ImportDecl{..}) = [SimpleImportDecl {
 #endif
     isSafe = ideclSafe,
     qualifiedStyle = convertQualifiedStyle ideclQualified,
-    isImplicit = ideclImplicit,
+    -- GHC 9.6: ideclImplicit moved into the extension field (XImportDeclPass).
+    isImplicit = ideclImplicit ideclExt,
     asModuleName = fmap (moduleNameToText . unLoc) ideclAs,
-    hidingSpec = case ideclHiding of
+    -- GHC 9.6: ideclHiding -> ideclImportList, whose Bool became an
+    -- ImportListInterpretation (@EverythingBut@ = hiding, @Exactly@ = explicit list).
+    hidingSpec = case ideclImportList of
         Nothing -> Nothing
-        Just (isHiding, names) -> Just $ HidingSpec {
-            isHiding = isHiding,
+        Just (impListInterp, names) -> Just $ HidingSpec {
+            isHiding = case impListInterp of
+                EverythingBut -> True
+                Exactly       -> False,
             names = convertLIEsToText names
         },
     line_number = spanToLine _span
@@ -198,7 +217,8 @@ moduleNameToText = T.pack . moduleNameString
 stringLiteralToText :: StringLiteral -> T.Text
 stringLiteralToText StringLiteral {sl_st} =
     case sl_st  of
-        SourceText s -> T.pack s
+        -- GHC 9.8: SourceText now wraps a FastString instead of a String.
+        SourceText s -> T.pack (unpackFS s)
         _ -> T.pack "NoSourceText"
 
 convertQualifiedStyle :: ImportDeclQualifiedStyle -> QualifiedStyle
@@ -207,8 +227,10 @@ convertQualifiedStyle QualifiedPre     = Fdep.Types.Qualified
 convertQualifiedStyle QualifiedPost    = Fdep.Types.Qualified
 
 -- (GenLocated (Anno [GenLocated l (IE GhcPs)]) [GenLocated l (IE GhcPs)])
-convertLIEsToText :: _ -> [T.Text]
-convertLIEsToText lies = 
+-- GHC 9.8 can't resolve the payload wildcard to a monotype; the sole caller passes
+-- the import list (@XRec GhcPs [LIE GhcPs]@), so state it explicitly.
+convertLIEsToText :: XRec GhcPs [LIE GhcPs] -> [T.Text]
+convertLIEsToText lies =
 #if __GLASGOW_HASKELL__ >= 900
     concatMap (ieNameToText . unLoc) (unXRec @(GhcPs) lies)
 #else
@@ -553,13 +575,16 @@ extractDetailsFromBind ty =
 
 
 loopOverLHsBindLR :: CliOptions -> WS.Connection -> (Maybe Text) -> Text -> LHsBindLR GhcTc GhcTc -> IO ()
-loopOverLHsBindLR cliOptions con mParentName path (L _ AbsBinds{abs_binds = binds}) =
+-- GHC 9.6: AbsBinds is no longer an HsBindLR constructor; it lives in the GhcTc
+-- extension point (@XHsBindsLR (AbsBinds ...)@ where XXHsBindsLR GhcTc = AbsBinds).
+loopOverLHsBindLR cliOptions con mParentName path (L _ (XHsBindsLR (AbsBinds{abs_binds = binds}))) =
     mapM_ (loopOverLHsBindLR cliOptions con mParentName path) $ bagToList binds
 loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
     let typesUsed = (map varType $ (bind ^? biplateRef :: [Var])) <> (map idType $ (bind ^? biplateRef :: [Id])) <> (bind ^? biplateRef :: [Type])
     case bind of
 #if __GLASGOW_HASKELL__ >= 900
-        (FunBind _ id matches _) -> do
+        -- GHC 9.6: FunBind lost its trailing fun_tick field (moved into fun_ext).
+        (FunBind _ id matches) -> do
 #else
         (FunBind _ id matches _ _) -> do
 #endif
@@ -637,7 +662,9 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
             name <- pure (fName <> "**" <> (T.pack ((showSDocUnsafe . ppr) $ locA location)))
             nestedNameWithParent <- pure $ (maybe (name) (\x -> x <> "::" <> name) mParentName)
             processAndSendTypeDetails cliOptions con _path nestedNameWithParent typesUsed
-            processFunctionInputOutput (pat_ext) cliOptions con _path nestedNameWithParent
+            -- GHC 9.6: XPatBind GhcTc is now a tuple (Type, ticks); the pattern's
+            -- Type (which is all processFunctionInputOutput needs) is its first element.
+            processFunctionInputOutput (fst pat_ext) cliOptions con _path nestedNameWithParent
             if (maybeBool $ tc_funcs cliOptions)
                 then mapM_ (processExpr nestedNameWithParent _path) (stmts <> map (\v -> wrapXRec @(GhcTc) $ HsVar noExtField v) (tail' ids))
                 else when (not $ "$$" `T.isInfixOf` name) $
@@ -689,15 +716,15 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
             processExpr keyFunction path funr
         processExpr keyFunction path (L _ (NegApp _ funl _)) =
             processExpr keyFunction path funl
-        processExpr keyFunction path (L _ (HsTick _ _ fun)) =
-            processExpr keyFunction path fun
+        -- GHC 9.6: HsTick/HsBinTick moved out of HsExpr into XXExprGhcTc; they are
+        -- handled in processXXExpr (reached via the XExpr case below) so the
+        -- "process the ticked expression" behaviour is preserved unchanged.
         processExpr keyFunction path (L _ (HsStatic _ fun)) =
-            processExpr keyFunction path fun
-        processExpr keyFunction path (L _ (HsBinTick _ _ _ fun)) =
             processExpr keyFunction path fun
         processExpr keyFunction path (L _ (ExprWithTySig _ fun _)) =
             processExpr keyFunction path fun
-        processExpr keyFunction path (L _ (HsLet _ exprLStmt func)) = do
+        -- GHC 9.6: HsLet gained let/in keyword tokens (ext, letTok, binds, inTok, body).
+        processExpr keyFunction path (L _ (HsLet _ _ exprLStmt _ func)) = do
 #if __GLASGOW_HASKELL__ >= 900
             processHsLocalBinds keyFunction path exprLStmt
 #else
@@ -711,10 +738,13 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
             void $ mapM (processMatch keyFunction path) (unLoc $ mg_alts exprLStmt)
         processExpr keyFunction path (L _ (ExplicitSum _ _ _ fun)) = processExpr keyFunction path fun
         processExpr keyFunction path (L _ (SectionR _ funl funr)) = processExpr keyFunction path funl <> processExpr keyFunction path funr
-        processExpr keyFunction path (L _ (HsPar _ fun)) =
+        -- GHC 9.6: HsPar gained parenthesis tokens (ext, openTok, expr, closeTok).
+        processExpr keyFunction path (L _ (HsPar _ _ fun _)) =
             processExpr keyFunction path fun
-        processExpr keyFunction path (L _ (HsAppType _ fun _)) = processExpr keyFunction path fun
-        processExpr keyFunction path (L _ x@(HsLamCase _ exprLStmt)) =
+        -- GHC 9.6: HsAppType gained an @-token field (ext, expr, atTok, wcType).
+        processExpr keyFunction path (L _ (HsAppType _ fun _ _)) = processExpr keyFunction path fun
+        -- GHC 9.6: HsLamCase gained a LamCaseVariant field (ext, variant, matchgroup).
+        processExpr keyFunction path (L _ x@(HsLamCase _ _ exprLStmt)) =
             void $ mapM (processMatch keyFunction path) (unLoc $ mg_alts exprLStmt)
         processExpr keyFunction path (L _ x@(HsLam _ exprLStmt)) =
             void $ mapM (processMatch keyFunction path) (unLoc $ mg_alts exprLStmt)
@@ -724,11 +754,11 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
         processExpr keyFunction path y@(L _ x@(HsOverLit _ overLitVal)) = do
             expr <- pure $ transformFromNameStableString (Just $ ("$_lit$" <> (T.pack $ showSDocUnsafe $ ppr overLitVal)), (Just $ T.pack $ getLocTC' $ y), (Just $ T.pack $ show $ toConstr overLitVal), mempty)
             sendTextData' cliOptions con path (decodeUtf8 $ toStrict $ Data.Aeson.encode $ Object $ HM.fromList [("key", String keyFunction), ("expr", toJSON expr)])
-        processExpr keyFunction path (L _ (HsSpliceE exprLStmtL exprLStmtR)) =
-            let stmtsL = (exprLStmtL ^? biplateRef :: [LHsExpr GhcTc])
-                stmtsR = (exprLStmtR ^? biplateRef :: [LHsExpr GhcTc])
-            in void $ mapM (processExpr keyFunction path) (stmtsL <> stmtsR)
-        processExpr keyFunction path y@(L _ x@(HsConLikeOut _ hsType)) = do
+        -- GHC 9.8: typechecked ConLike expressions live in the GhcTc extension
+        -- (@XExpr (ConLikeTc ...)@) instead of the old @HsConLikeOut@ constructor.
+        -- Kept here (before the generic XExpr case below) to preserve the exact
+        -- @$_type$@ emission and source location of the 9.2 code.
+        processExpr keyFunction path y@(L _ (XExpr (ConLikeTc hsType _ _))) = do
             expr <- pure $ transformFromNameStableString (Just $ ("$_type$" <> (T.pack $ showSDocUnsafe $ ppr hsType)), (Just $ T.pack $ getLocTC' $ y), (Just $ T.pack $ show $ toConstr hsType), mempty)
             sendTextData' cliOptions con path (decodeUtf8 $ toStrict $ Data.Aeson.encode $ Object $ HM.fromList [("key", String keyFunction), ("expr", toJSON expr)])
         processExpr keyFunction path y@(L _ x@(HsIPVar _ implicit)) = do
@@ -768,11 +798,7 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
                     processExpr keyFunction path l
                     processExpr keyFunction path m
                     processExpr keyFunction path r
-        processExpr keyFunction path (L _ (HsRnBracketOut _ exprLStmtL exprLStmtR)) =
-            let stmtsLNoLoc = (exprLStmtL ^? biplateRef :: [HsExpr GhcTc])
-                stmtsRNoLoc = (exprLStmtR ^? biplateRef :: [HsExpr GhcTc])
-            in void $ mapM (processExpr keyFunction path) (map (wrapXRec @(GhcTc)) $ (stmtsLNoLoc <> stmtsRNoLoc))
-        processExpr keyFunction path x@(L _ (HsRecFld _ exprLStmt)) = getDataTypeDetails keyFunction path x
+        processExpr keyFunction path x@(L _ (HsRecSel _ _)) = getDataTypeDetails keyFunction path x
         processExpr keyFunction path y@(L _ x@(RecordCon expr (L _ (iD)) rcon_flds)) = getDataTypeDetails keyFunction path y
         processExpr keyFunction path x@(L _ (RecordUpd _ rupd_expr rupd_flds)) = getDataTypeDetails keyFunction path x
         processExpr keyFunction path (L _ (ExplicitTuple _ exprLStmt _)) =
@@ -783,13 +809,10 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
                         _ -> pure ()) l
         processExpr keyFunction path y@(L _ (XExpr overLitVal)) = do
             processXXExpr keyFunction path overLitVal
-        processExpr keyFunction path y@(L _ x@(HsOverLabel _ fs)) = do
+        -- GHC 9.6: HsOverLabel gained a SourceText field (ext, sourceText, fs).
+        processExpr keyFunction path y@(L _ x@(HsOverLabel _ _ fs)) = do
             expr <- pure $ transformFromNameStableString (Just $ ("$_overLabel$" <> (T.pack $ showSDocUnsafe $ ppr fs)), (Just $ T.pack $ getLocTC' $ y), (Just $ T.pack $ show $ toConstr x), mempty)
             sendTextData' cliOptions con path (decodeUtf8 $ toStrict $ Data.Aeson.encode $ Object $ HM.fromList [("key", String keyFunction), ("expr", toJSON expr)])
-        processExpr keyFunction path (L _ (HsTcBracketOut b mQW exprLStmtL exprLStmtR)) =
-            let stmtsL = (exprLStmtL ^? biplateRef :: [LHsExpr GhcTc])
-                stmtsR = (exprLStmtR ^? biplateRef :: [LHsExpr GhcTc])
-            in void $ mapM (processExpr keyFunction path) (stmtsL <> stmtsR)
         processExpr keyFunction path (L _ x) =
             let stmts = (x ^? biplateRef :: [LHsExpr GhcTc])
                 stmtsNoLoc = (x ^? biplateRef :: [HsExpr GhcTc])
@@ -859,7 +882,7 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
 #else
         getDataTypeDetails keyFunction path (L _ (RecordCon _ (iD) rcon_flds)) = (extractRecordBinds keyFunction path (T.pack $ nameStableString $ getName (GHC.unLoc iD)) (rcon_flds))
 #endif
-        getDataTypeDetails keyFunction path y@(L _ (RecordUpd x@(RecordUpdTc rupd_cons rupd_in_tys rupd_out_tys rupd_wrap) rupd_expr rupd_flds)) = do
+        getDataTypeDetails keyFunction path y@(L _ (RecordUpd x rupd_expr rupd_flds)) = do
             let names = (x ^? biplateRef :: [DataCon])
                 types = (x ^? biplateRef :: [Type])
             mapM_ (\xx -> do
@@ -873,29 +896,22 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
                 sendTextData' cliOptions con path (decodeUtf8 $ toStrict $ Data.Aeson.encode $ Object $ HM.fromList [("key", String keyFunction), ("expr", toJSON expr)])
                 ) types
             (getFieldUpdates y keyFunction path (T.pack $ showSDocUnsafe $ ppr rupd_expr) rupd_flds)
-        getDataTypeDetails keyFunction path y@(L _ (HsRecFld _ (Unambiguous id' lnrdrname))) = do
+        -- GHC 9.6+: @HsRecFld@ became @HsRecSel@ and @AmbiguousFieldOcc@ was
+        -- removed in favour of @FieldOcc@ (whose extension holds the selector Id
+        -- for GhcTc). The old Ambiguous/Unambiguous cases did identical work, so
+        -- they collapse into one.
+        getDataTypeDetails keyFunction path y@(L _ (HsRecSel _ (FieldOcc id' _))) = do
             let name = T.pack $ nameStableString $ varName id'
                 _type = T.pack $ showSDocUnsafe $ ppr $ varType id'
             expr <- pure $ transformFromNameStableString (Just name, Just $ T.pack $ getLocTC' $ y, Just _type, mempty)
             sendTextData' cliOptions con path (decodeUtf8 $ toStrict $ Data.Aeson.encode $ Object $ HM.fromList [("key", String keyFunction), ("expr", toJSON expr)])
-            -- case reLocN lnrdrname of
-            --     (L l rdrname) -> do
-            --         print $ (handleRdrName rdrname,showSDocUnsafe $ ppr id')
-        getDataTypeDetails keyFunction path y@(L _ (HsRecFld _ (Ambiguous   id'  lnrdrname))) = do
-            let name = T.pack $ nameStableString $ varName id'
-                _type = T.pack $ showSDocUnsafe $ ppr $ varType id'
-            expr <- pure $ transformFromNameStableString (Just name, Just $ T.pack $ getLocTC' $ y, Just _type, mempty)
-            sendTextData' cliOptions con path (decodeUtf8 $ toStrict $ Data.Aeson.encode $ Object $ HM.fromList [("key", String keyFunction), ("expr", toJSON expr)])
-            -- case reLocN lnrdrname of
-            --     (L l rdrname) -> do
-            --         print $ (handleRdrName rdrname,showSDocUnsafe $ ppr id')
-        getDataTypeDetails keyFunction path (L _ y@(HsRecFld _ _)) = pure ()
         getDataTypeDetails keyFunction path _ = pure ()
 
         -- inferFieldType :: Name -> String
         inferFieldTypeFieldOcc (L _ (FieldOcc _ (L _ rdrName))) = handleRdrName rdrName
         inferFieldTypeFieldOcc (L _ (XFieldOcc _)) = mempty--handleRdrName rdrName
-        inferFieldTypeAFieldOcc = (handleRdrName . rdrNameAmbiguousFieldOcc . unLoc)
+        -- GHC 9.6: rdrNameAmbiguousFieldOcc was renamed to ambiguousFieldOccRdrName.
+        inferFieldTypeAFieldOcc = (handleRdrName . ambiguousFieldOccRdrName . unLoc)
 
         handleRdrName :: RdrName -> String
         handleRdrName rdrName = case rdrName of
@@ -912,14 +928,17 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
         --         Exact name -> nameStableString name
 
 #if __GLASGOW_HASKELL__ >= 900
-        getFieldUpdates :: GenLocated (SrcSpanAnn' a) e -> Text -> Text -> Text -> Either [LHsRecUpdField GhcTc] [LHsRecUpdProj GhcTc] -> IO ()
+        -- GHC 9.6: rupd_flds is now a @LHsRecUpdFields@ sum type rather than an
+        -- @Either@; @RegularRecUpdFields@ replaces @Left@ (regular field updates)
+        -- and @OverloadedRecUpdFields@ replaces @Right@ (overloaded projections).
+        getFieldUpdates :: GenLocated (SrcSpanAnn' a) e -> Text -> Text -> Text -> LHsRecUpdFields GhcTc -> IO ()
         getFieldUpdates _ keyFunction path type_ fields =
             case fields of
-                Left x -> (mapM_ (extractField)) x
-                Right x -> (mapM_ (processRecordProj) x)
+                RegularRecUpdFields _ x    -> (mapM_ (extractField)) x
+                OverloadedRecUpdFields _ x -> (mapM_ (processRecordProj) x)
             where
             processRecordProj :: LHsRecProj GhcTc (LHsExpr GhcTc) -> IO ()
-            processRecordProj (L _ (HsRecField { hsRecFieldAnn, hsRecFieldLbl=lbl , hsRecFieldArg=expr ,hsRecPun=pun })) = do
+            processRecordProj (L _ (HsFieldBind { hfbAnn = hsRecFieldAnn, hfbLHS=lbl , hfbRHS=expr ,hfbPun=pun })) = do
                 let fieldName = (T.pack $ showSDocUnsafe $ ppr lbl)
                 case lbl of
                     (L _ (FieldLabelStrings ll)) -> mapM_ (processHsFieldLabel keyFunction path) ll
@@ -927,18 +946,18 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
                 processExpr keyFunction path expr
 
             -- extractField :: HsRecUpdField GhcTc -> IO ()
-            extractField y@(L _ (HsRecField{hsRecFieldLbl = lbl, hsRecFieldArg = expr, hsRecPun = pun})) =do
+            extractField y@(L _ (HsFieldBind{hfbLHS = lbl, hfbRHS = expr, hfbPun = pun})) =do
                 let fieldName = (T.pack $ showSDocUnsafe $ ppr lbl)
                     fieldType = (T.pack $ inferFieldTypeAFieldOcc lbl)
                 processExpr keyFunction path expr
                 expr' <- pure $ transformFromNameStableString (Just $ ("$_fieldName$" <> fieldName), (Just $ T.pack $ getLocTC' $ y), (Just $ fieldType), mempty)
                 sendTextData' cliOptions con path (decodeUtf8 $ toStrict $ Data.Aeson.encode $ Object $ HM.fromList [("key", String keyFunction), ("expr", toJSON expr')])
 
-        processHsFieldLabel :: Text -> Text -> Located (HsFieldLabel GhcTc) -> IO ()
-        processHsFieldLabel keyFunction path y@(L l x@(HsFieldLabel _ (L _ hflLabel))) = do
+        processHsFieldLabel :: Text -> Text -> XRec GhcTc (DotFieldOcc GhcTc) -> IO ()
+        processHsFieldLabel keyFunction path y@(L l x@(DotFieldOcc _ (L _ hflLabel))) = do
             expr <- pure $ transformFromNameStableString (Just $ ("$_fieldName$" <> (T.pack $ showSDocUnsafe $ ppr hflLabel)), (Just $ T.pack $ showSDocUnsafe $ ppr $ getLoc $ y), (Just $ T.pack $ show $ toConstr x), mempty)
             sendTextData' cliOptions con path (decodeUtf8 $ toStrict $ Data.Aeson.encode $ Object $ HM.fromList [("key", String keyFunction), ("expr", toJSON expr)])
-        processHsFieldLabel keyFunction path (L _ (XHsFieldLabel _)) = pure ()
+        processHsFieldLabel keyFunction path (L _ (XDotFieldOcc _)) = pure ()
 #else
         getFieldUpdates :: _ -> Text -> Text -> Text -> [LHsRecUpdField GhcTc]-> IO ()
         getFieldUpdates y keyFunction path type_ fields = mapM_ extractField fields
@@ -957,7 +976,7 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
             mapM_ extractField fields
             where
             extractField :: LHsRecField GhcTc (LHsExpr GhcTc) -> IO ()
-            extractField (L l x@(HsRecField{hsRecFieldLbl = lbl, hsRecFieldArg = expr, hsRecPun = pun})) = do
+            extractField (L l x@(HsFieldBind{hfbLHS = lbl, hfbRHS = expr, hfbPun = pun})) = do
                 let fieldName = (T.pack $ showSDocUnsafe $ ppr lbl)
                     fieldType = (T.pack $ inferFieldTypeFieldOcc lbl)
                 processExpr keyFunction path expr
@@ -979,7 +998,8 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
         extractExprsFromCmdLStmt keyFunction path (L _ stmt) = extractExprsFromStmtLR keyFunction path stmt
 
         extractExprsFromMatchGroup :: Text -> Text -> MatchGroup GhcTc (LHsCmd GhcTc) -> IO ()
-        extractExprsFromMatchGroup keyFunction path (MG _ (L _ matches) _) = mapM_ (extractExprsFromMatch keyFunction path) matches
+        -- GHC 9.6: MatchGroup lost its trailing mg_origin field (moved into mg_ext).
+        extractExprsFromMatchGroup keyFunction path (MG _ (L _ matches)) = mapM_ (extractExprsFromMatch keyFunction path) matches
 
         extractExprsFromMatch :: Text -> Text ->  LMatch GhcTc (LHsCmd GhcTc) -> IO ()
         extractExprsFromMatch keyFunction path (L _ (Match _ _ _ grhs)) = extractExprsFromGRHSs keyFunction path grhs
@@ -1084,18 +1104,21 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
                 extractExprsFromLHsCmd keyFunction path cmd'
                 processExpr keyFunction path e
             HsCmdLam _ mg -> extractExprsFromMatchGroup keyFunction path mg
-            HsCmdPar _ cmd' ->
+            -- GHC 9.6: HsCmdPar gained parenthesis tokens (ext, openTok, cmd, closeTok).
+            HsCmdPar _ _ cmd' _ ->
                 extractExprsFromLHsCmd keyFunction path cmd'
             HsCmdCase _ e mg -> do
                 extractExprsFromMatchGroup keyFunction path mg
                 processExpr keyFunction path e
-            HsCmdLamCase _ mg ->
+            -- GHC 9.6: HsCmdLamCase gained a LamCaseVariant field (ext, variant, matchgroup).
+            HsCmdLamCase _ _ mg ->
                 extractExprsFromMatchGroup keyFunction path mg
             HsCmdIf _ _ predExpr thenCmd elseCmd -> do
                 extractExprsFromLHsCmd keyFunction path elseCmd
                 extractExprsFromLHsCmd keyFunction path thenCmd
                 processExpr keyFunction path predExpr
-            HsCmdLet _ binds cmd' -> do
+            -- GHC 9.6: HsCmdLet gained let/in keyword tokens (ext, letTok, binds, inTok, cmd).
+            HsCmdLet _ _ binds _ cmd' -> do
                 processHsLocalBinds keyFunction path binds
                 extractExprsFromLHsCmd keyFunction path cmd'
             HsCmdDo _ stmts ->
@@ -1110,10 +1133,12 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
                     sendTextData' cliOptions con path (decodeUtf8 $ toStrict $ Data.Aeson.encode $ Object $ HM.fromList [("key", String keyFunction), ("expr", toJSON expr)])
                 VarPat _ var    -> processExpr keyFunction path ((wrapXRec @(GhcTc)) (HsVar noExtField (var)))
                 LazyPat _ p   -> (extractExprsFromPat keyFunction path) p
-                AsPat _ var p   -> do
+                -- GHC 9.6: AsPat gained an @-token field (ext, id, atTok, pat).
+                AsPat _ var _ p   -> do
                     processExpr keyFunction path ((wrapXRec @(GhcTc)) (HsVar noExtField (var)))
                     (extractExprsFromPat keyFunction path) p
-                ParPat _ p    -> (extractExprsFromPat keyFunction path) p
+                -- GHC 9.6: ParPat gained parenthesis tokens (ext, openTok, pat, closeTok).
+                ParPat _ _ p _    -> (extractExprsFromPat keyFunction path) p
                 BangPat _ p   -> (extractExprsFromPat keyFunction path) p
                 ListPat _ ps  -> mapM_ (extractExprsFromPat keyFunction path) ps
                 TuplePat _ ps _ -> mapM_ (extractExprsFromPat keyFunction path) ps
@@ -1141,7 +1166,9 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
                 XPat _         -> pure ()
             where
             extractExprsFromOverLit :: HsOverLit GhcTc -> IO ()
-            extractExprsFromOverLit (OverLit _ _ e) = processExpr keyFunction path $ wrapXRec @(GhcTc) e
+            -- GHC 9.6: HsOverLit is now @OverLit ext val@; the typechecked witness
+            -- expression moved into the extension (@OverLitTc _ ol_witness _@).
+            extractExprsFromOverLit (OverLit (OverLitTc _ e _) _) = processExpr keyFunction path $ wrapXRec @(GhcTc) e
 
             extractExprsFromHsConPatDetails :: Text -> Text -> HsConPatDetails GhcTc -> IO ()
             extractExprsFromHsConPatDetails keyFunction' path' (PrefixCon _ args) = mapM_ (extractExprsFromPat keyFunction' path') args
@@ -1160,18 +1187,35 @@ loopOverLHsBindLR cliOptions con mParentName _path (L location bind) = do
             mapM_ (extractExprsFromStmtLRHsExpr keyFunction path) (map (unLoc) exprLStmt)
             extractExprsFromPat keyFunction path lpat
 
-        extractExprsFromSplice :: HsSplice GhcTc -> [LHsExpr GhcTc]
-        extractExprsFromSplice (HsTypedSplice _ _ _ e) = [e]
-        extractExprsFromSplice (HsUntypedSplice _ _ _ e) = [e]
-        extractExprsFromSplice (HsQuasiQuote _ _ _ _ _) = []
-        extractExprsFromSplice (HsSpliced _ _ _) = []
-        extractExprsFromSplice _ = []
+        -- GHC 9.6: the @HsSplice@ sum type was removed; a typechecked splice
+        -- pattern now carries an @HsUntypedSplice GhcTc@. Extract nested
+        -- expressions generically (same set the old constructor matches yielded).
+        extractExprsFromSplice :: HsUntypedSplice GhcTc -> [LHsExpr GhcTc]
+        extractExprsFromSplice splice = (splice ^? biplateRef :: [LHsExpr GhcTc])
 
         processXXExpr :: Text -> Text -> XXExprGhcTc -> IO ()
         processXXExpr keyFunction path (WrapExpr (HsWrap hsWrapper hsExpr)) =
             processExpr keyFunction path (wrapXRec @(GhcTc) hsExpr)
         processXXExpr keyFunction path (ExpansionExpr (HsExpanded _ expansionExpr)) =
             mapM_ (processExpr keyFunction path . (wrapXRec @(GhcTc))) [expansionExpr]
+        -- GHC 9.6+ moved HsTick/HsBinTick from HsExpr into XXExprGhcTc. Process the
+        -- ticked expression directly, exactly as the old HsExpr cases in processExpr did.
+        processXXExpr keyFunction path (HsTick _ fun) =
+            processExpr keyFunction path fun
+        processXXExpr keyFunction path (HsBinTick _ _ fun) =
+            processExpr keyFunction path fun
+        -- GHC 9.6+ also added ConLikeTc to XXExprGhcTc; it is handled earlier (in
+        -- processExpr). Anything else recurses into sub-expressions, matching the
+        -- old generic fallthrough (and keeping this match exhaustive).
+        processXXExpr keyFunction path xxexpr =
+            let stmts = (xxexpr ^? biplateRef :: [LHsExpr GhcTc])
+                stmtsNoLoc = (xxexpr ^? biplateRef :: [HsExpr GhcTc])
+            in void $ mapM (processExpr keyFunction path) (stmts <> map (wrapXRec @(GhcTc)) stmtsNoLoc)
+
+-- GHC 9.8 removed the @la2r@ helper from GHC.Parser.Annotation. Reconstruct it
+-- with its original definition (@realSrcSpan . locA@) to keep identical output.
+la2r :: SrcSpanAnn' a -> RealSrcSpan
+la2r = realSrcSpan . locA
 
 getLocTC' :: GenLocated (SrcSpanAnn' a) e -> String
 getLocTC' = (showSDocUnsafe . ppr . la2r . getLoc)
