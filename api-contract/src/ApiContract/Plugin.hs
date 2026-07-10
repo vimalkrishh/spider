@@ -86,6 +86,10 @@ import ErrUtils
 #endif
 
 import Control.Reference (biplateRef, (^?))
+-- Provides the `Biplate` instances for `biplateRef` (via Data). fdep/sheriff import
+-- this directly too; api-contract previously got it transitively through the large-records
+-- imports, which also dragged in large-anon's conflicting orphan Outputable instance.
+import Data.Generics.Uniplate.Data ()
 import ApiContract.Types
 -- import Data.Aeson
 import Data.List.Extra (intercalate, isSuffixOf, replace, splitOn,groupBy)
@@ -105,10 +109,17 @@ import System.Directory (createDirectoryIfMissing, removeFile,doesFileExist)
 import System.Directory.Internal.Prelude hiding (mapM, mapM_)
 import Prelude hiding (id, mapM, mapM_)
 import Control.Exception (evaluate)
+-- These large-records/large-anon/RDP plugins are only used under the (never-defined)
+-- ENABLE_LR_PLUGINS block below. Importing them unconditionally dragged large-anon's
+-- orphan `Outputable (GenLocated l e)` into scope, which overlaps GHC's own instance
+-- and breaks `ppr` on GhcPs AST in downstream package sets (e.g. euler-hs). Gate the
+-- imports on the same macro as their usage so the default build never sees the orphan.
+#if defined(ENABLE_LR_PLUGINS)
 import qualified Data.Record.Plugin as DRP
 import qualified Data.Record.Anon.Plugin as DRAP
 import qualified Data.Record.Plugin.HasFieldPattern as DRPH
 import qualified RecordDotPreprocessor as RDP
+#endif
 import qualified Data.Yaml as YAML
 import Control.Monad (foldM)
 import Data.Char
