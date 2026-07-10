@@ -95,9 +95,16 @@ import System.Directory (createDirectoryIfMissing, removeFile)
 import System.Directory.Internal.Prelude hiding (mapM, mapM_,log)
 import Prelude hiding (id, mapM_,log)
 import Control.Exception (evaluate)
+-- Only used under the ENABLE_LR_PLUGINS block below; importing them unconditionally
+-- dragged large-anon's orphan `Outputable (GenLocated l e)` into scope, overlapping
+-- GHC's own instance and breaking `ppr` on GhcPs AST in euler-hs's package set.
+-- (RDP is used unconditionally, so its import stays. Biplate instances come from the
+-- Data.Generics.Uniplate.Data import above, not from these.)
+#if defined(ENABLE_LR_PLUGINS)
 import qualified Data.Record.Plugin as DRP
 import qualified Data.Record.Anon.Plugin as DRAP
 import qualified Data.Record.Plugin.HasFieldPattern as DRPH
+#endif
 import qualified RecordDotPreprocessor as RDP
 import qualified ApiContract.Plugin as ApiContract
 -- import qualified Fdep.Plugin as Fdep
