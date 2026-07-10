@@ -7,6 +7,7 @@ import GHC hiding (exprType)
 #if __GLASGOW_HASKELL__ >= 900
 import GHC.Core.TyCo.Rep
 import GHC.Tc.Types.Evidence
+import GHC.Types.Var (FunTyFlag)
 import Language.Haskell.Syntax.Expr
 #else
 import GHC.Hs.Expr
@@ -15,7 +16,9 @@ import TyCoRep
 #endif
 
 #if __GLASGOW_HASKELL__ >= 900
-pattern PatFunTy :: AnonArgFlag -> Type -> Type -> Type
+-- GHC 9.6: AnonArgFlag was renamed to FunTyFlag (FunTy field order unchanged:
+-- ft_af, ft_mult, ft_arg, ft_res).
+pattern PatFunTy :: FunTyFlag -> Type -> Type -> Type
 pattern PatFunTy anonArgFlag ty1 ty2 <- (FunTy anonArgFlag _ ty1 ty2)
 
 pattern PatHsIf :: LHsExpr (GhcPass p) -> LHsExpr (GhcPass p) -> LHsExpr (GhcPass p) -> HsExpr (GhcPass p)

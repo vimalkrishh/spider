@@ -5,6 +5,10 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeSynonymInstances #-}
+-- GHC 9.8 enables -Wx-partial (head/tail) by default; with -Werror it would fail.
+-- This module uses head/tail in provably-safe spots; suppress the new lint only
+-- (no runtime behaviour is affected).
+{-# OPTIONS_GHC -Wno-x-partial #-}
 
 module Sheriff.Plugin (plugin) where
 
@@ -47,8 +51,10 @@ import GHC.Data.Bag
 import GHC.HsToCore.Monad
 import GHC.HsToCore.Expr
 import GHC.Plugins hiding ((<>), getHscEnv, purePlugin)
+import GHC.Tc.Errors.Types (TcRnMessage, mkTcRnUnknownMessage)
 import GHC.Tc.Types
 import GHC.Tc.Types.Evidence
+import GHC.Types.Error (mkPlainError, noHints)
 import GHC.Tc.Utils.Monad
 import GHC.Tc.Utils.TcType
 import GHC.Types.Annotations
@@ -241,7 +247,7 @@ checkInfiniteRecursion recurseForBinds rule (L _ ap@(FunBind{fun_id = funVar, fu
   let ?pluginOpts = ?pluginOpts {nameModuleMap = currNameModMap}
   errs <- mapM (checkAndVerifyAlt recurseForBinds rule funVar) (fmap unLoc . unLoc $ mg_alts matches)
   pure $ concat errs
-checkInfiniteRecursion recurseForBinds rule (L _ ap@(AbsBinds{abs_binds = binds, abs_exports = bindVars})) = do
+checkInfiniteRecursion recurseForBinds rule (L _ ap@(XHsBindsLR (AbsBinds{abs_binds = binds, abs_exports = bindVars}))) = do
   let mbVar = case bindVars of
                 x : _ -> Just $ (varName $ abe_poly x, varName $ abe_mono x)
                 _ -> Nothing
@@ -340,7 +346,7 @@ checkAndVerifyAlt recurseForBinds rule ap@(L loc fnVar) match = do
 
     checkAndGetExpr :: LHsExpr GhcTc -> [LHsExpr GhcTc]
     checkAndGetExpr (L loc expr) = case expr of
-      HsLet _ _ inStmt -> checkAndGetExpr inStmt
+      HsLet _ _ _ _ inStmt -> checkAndGetExpr inStmt
       HsApp _ _ _ -> [L loc expr]
       HsVar _ _ -> [L loc expr]
       HsDo _ _ doStmts -> concatMap checkAndGetExpr $ foldr isLastStmt [] (traverseAst doStmts)
@@ -368,9 +374,9 @@ checkAndVerifyAlt recurseForBinds rule ap@(L loc fnVar) match = do
 
     checkAndGetMaybeLambdaCaseOrLambdaMG :: LHsExpr GhcTc -> Maybe (MatchGroup GhcTc (LHsExpr GhcTc))
     checkAndGetMaybeLambdaCaseOrLambdaMG (L loc expr) = case expr of
-      (HsLamCase _ mg)   -> Just mg -- LambdaCase
+      (HsLamCase _ _ mg) -> Just mg -- LambdaCase
       (HsLam _ mg)       -> Just mg -- Lambda Function
-      (HsLet _ _ inStmt) -> checkAndGetMaybeLambdaCaseOrLambdaMG inStmt
+      (HsLet _ _ _ _ inStmt) -> checkAndGetMaybeLambdaCaseOrLambdaMG inStmt
       PatHsWrap _ wrapExpr -> checkAndGetMaybeLambdaCaseOrLambdaMG (L loc wrapExpr)
       OpApp _ _ op rApp -> case showS op of
         "(.)" -> checkAndGetMaybeLambdaCaseOrLambdaMG rApp
@@ -401,7 +407,7 @@ loopOverModBinds _ (L _ ap@(PatBind{})) = do
 loopOverModBinds _ (L _ ap@(VarBind{})) = do 
   -- liftIO $ print "VarBinds" >> showOutputable ap
   pure []
-loopOverModBinds rules (L _ ap@(AbsBinds {abs_binds = binds})) = do
+loopOverModBinds rules (L _ ap@(XHsBindsLR (AbsBinds {abs_binds = binds}))) = do
   -- liftIO $ print "AbsBinds" >> showOutputable ap
   list <- mapM (loopOverModBinds rules) $ bagToList binds
   pure (concat list)
@@ -734,7 +740,7 @@ getIsClauseData fieldArg _comp _clause = do
     None     -> when ((logWarnInfo . pluginOpts $ ?pluginOpts)) (liftIO $ print $ "Can't identify the way in which DB field is specified: " <> showS fieldArg) >> pure Nothing
     Selector -> do
       let modFieldArg arg = case arg of
-                        (L _ (HsRecFld _ fldOcc))   -> showS $ selectorAmbiguousFieldOcc fldOcc
+                        (L _ (HsRecSel _ fldOcc))   -> showS $ foExt fldOcc
                         (L loc (PatHsWrap _ wExpr)) -> modFieldArg (L loc wExpr)
                         (L _ expr)                  -> showS expr
       case (splitOn ":" $ modFieldArg fieldArg) of
@@ -742,21 +748,21 @@ getIsClauseData fieldArg _comp _clause = do
         _ -> when ((logWarnInfo . pluginOpts $ ?pluginOpts)) (liftIO $ print "Invalid pattern for Selector way") >> pure Nothing
     RecordDot -> do
       let tyApps = filter (\x -> case x of 
-                                  (HsApp _ (L _ (HsAppType _ _ fldName)) tableVar) -> True
-                                  (PatHsWrap (WpCompose (WpEvApp (EvExpr _hasFld)) (WpCompose (WpTyApp _fldType) (WpTyApp tableVar))) (HsAppType _ _ fldName)) -> True
+                                  (HsApp _ (L _ (HsAppType _ _ _ fldName)) tableVar) -> True
+                                  (PatHsWrap (WpCompose (WpEvApp (EvExpr _hasFld)) (WpCompose (WpTyApp _fldType) (WpTyApp tableVar))) (HsAppType _ _ _ fldName)) -> True
                                   _ -> False
                           ) $ (traverseAst fieldArg :: [HsExpr GhcTc])
       if length tyApps > 0 
         then 
           case head tyApps of
-            (HsApp _ (L _ (HsAppType _ _ fldName)) tableVar) -> do
+            (HsApp _ (L _ (HsAppType _ _ _ fldName)) tableVar) -> do
               typ <- getHsExprType (logTypeDebugging . pluginOpts $ ?pluginOpts) tableVar
               let tblName' = case typ of
                               AppTy ty1 _    -> showS ty1
                               TyConApp ty1 _ -> showS ty1
                               ty             -> showS ty
               pure $ Just (getStrFromHsWildCardBndrs fldName, take (length tblName' - 1) tblName')
-            (PatHsWrap (WpCompose (WpEvApp (EvExpr _hasFld)) (WpCompose (WpTyApp _fldType) (WpTyApp tableType))) (HsAppType _ _ fldName)) ->
+            (PatHsWrap (WpCompose (WpEvApp (EvExpr _hasFld)) (WpCompose (WpTyApp _fldType) (WpTyApp tableType))) (HsAppType _ _ _ fldName)) ->
               let tblName' = case tableType of
                                   AppTy ty1 _    -> showS ty1
                                   TyConApp ty1 _ -> showS ty1
@@ -808,7 +814,7 @@ getIsClauseData fieldArg _comp _clause = do
 getDBFieldSpecType :: LHsExpr GhcTc -> DBFieldSpecType
 getDBFieldSpecType (L loc expr)
   | (PatHsWrap _ wExpr) <- expr = getDBFieldSpecType (L loc wExpr)
-  | (HsRecFld _ fldOcc) <- expr = checkExprString . showS $ selectorAmbiguousFieldOcc fldOcc
+  | (HsRecSel _ fldOcc) <- expr = checkExprString . showS $ foExt fldOcc
   | otherwise                   = checkExprString $ showS expr
   where
     checkExprString exprStr
@@ -820,7 +826,7 @@ getDBFieldSpecType (L loc expr)
 -- Get function name for the where clause for db rules cases
 getWhereClauseFnNameWithAllArgs :: LHsExpr GhcTc -> Maybe (String, [LHsExpr GhcTc])
 getWhereClauseFnNameWithAllArgs (L _ (HsVar _ v)) = Just (getVarName $ unLoc v, [])
-getWhereClauseFnNameWithAllArgs (L _ (HsConLikeOut _ cl)) = (\clId -> (getVarName clId, [])) <$> conLikeWrapId cl
+getWhereClauseFnNameWithAllArgs (L _ (XExpr (ConLikeTc cl _ _))) = (\clId -> (getVarName clId, [])) <$> conLikeWrapId cl
 getWhereClauseFnNameWithAllArgs (L _ (HsApp _ (L _ (HsVar _ v)) funr)) = Just (getVarName $ unLoc v, [funr])
 getWhereClauseFnNameWithAllArgs (L _ (HsApp _ funl funr)) = do
   let res = getWhereClauseFnNameWithAllArgs funl
@@ -831,7 +837,7 @@ getWhereClauseFnNameWithAllArgs (L loc (OpApp _ lfun op rfun)) = do
   case showS op of
     "($)" -> getWhereClauseFnNameWithAllArgs $ (L loc (HsApp noExtFieldOrAnn lfun rfun))
     _ -> Nothing
-getWhereClauseFnNameWithAllArgs (L loc ap@(HsPar _ expr)) = getWhereClauseFnNameWithAllArgs expr
+getWhereClauseFnNameWithAllArgs (L loc ap@(HsPar _ _ expr _)) = getWhereClauseFnNameWithAllArgs expr
 -- If condition inside the list, add dummy type
 getWhereClauseFnNameWithAllArgs (L loc ap@(PatHsIf _pred thenCl elseCl)) = Just ("Or", [L loc (PatExplicitList (LitTy (StrTyLit "Dummy")) [thenCl, elseCl])])
 getWhereClauseFnNameWithAllArgs (L loc ap@(PatHsWrap _ expr)) = getWhereClauseFnNameWithAllArgs (L loc expr)
@@ -850,10 +856,10 @@ getWhereClauseFnNameWithAllArgs _ = Nothing
 -- Get function name & LHsExpr which gives resolved type with all it's arguments
 getFnNameAndTypeableExprWithAllArgs :: LHsExpr GhcTc -> Maybe (Located Var, LHsExpr GhcTc, [LHsExpr GhcTc])
 getFnNameAndTypeableExprWithAllArgs ap@(L loc (HsVar _ v)) = Just (getLocated v loc, ap, [])
-getFnNameAndTypeableExprWithAllArgs ap@(L _ (HsConLikeOut _ cl)) = (\clId -> (noExprLoc clId, ap, [])) <$> conLikeWrapId cl
-getFnNameAndTypeableExprWithAllArgs (L _ (HsAppType _ expr _)) = getFnNameAndTypeableExprWithAllArgs expr
+getFnNameAndTypeableExprWithAllArgs ap@(L _ (XExpr (ConLikeTc cl _ _))) = (\clId -> (noExprLoc clId, ap, [])) <$> conLikeWrapId cl
+getFnNameAndTypeableExprWithAllArgs (L _ (HsAppType _ expr _ _)) = getFnNameAndTypeableExprWithAllArgs expr
 getFnNameAndTypeableExprWithAllArgs (L _ (HsApp _ ap@(L loc (HsVar _ v)) funr)) = Just (getLocated v loc, ap, [funr])
-getFnNameAndTypeableExprWithAllArgs (L _ (HsPar _ expr)) = getFnNameAndTypeableExprWithAllArgs expr
+getFnNameAndTypeableExprWithAllArgs (L _ (HsPar _ _ expr _)) = getFnNameAndTypeableExprWithAllArgs expr
 getFnNameAndTypeableExprWithAllArgs (L _ (HsApp _ funl funr)) = do
   let res = getFnNameAndTypeableExprWithAllArgs funl
   case res of
@@ -880,10 +886,10 @@ getFnNameAndTypeableExprWithAllArgs _ = Nothing
 -- Get function name with all it's arguments
 getFnNameWithAllArgs :: LHsExpr GhcTc -> Maybe (Located Var, [LHsExpr GhcTc])
 getFnNameWithAllArgs (L loc (HsVar _ v)) = Just (getLocated v loc, [])
-getFnNameWithAllArgs (L _ (HsConLikeOut _ cl)) = (\clId -> (noExprLoc clId, [])) <$> conLikeWrapId cl
-getFnNameWithAllArgs (L _ (HsAppType _ expr _)) = getFnNameWithAllArgs expr
+getFnNameWithAllArgs (L _ (XExpr (ConLikeTc cl _ _))) = (\clId -> (noExprLoc clId, [])) <$> conLikeWrapId cl
+getFnNameWithAllArgs (L _ (HsAppType _ expr _ _)) = getFnNameWithAllArgs expr
 getFnNameWithAllArgs (L _ (HsApp _ (L loc (HsVar _ v)) funr)) = Just (getLocated v loc, [funr])
-getFnNameWithAllArgs (L _ (HsPar _ expr)) = getFnNameWithAllArgs expr
+getFnNameWithAllArgs (L _ (HsPar _ _ expr _)) = getFnNameWithAllArgs expr
 getFnNameWithAllArgs (L _ (HsApp _ funl funr)) = do
   let res = getFnNameWithAllArgs funl
   case res of
@@ -953,8 +959,10 @@ isAllowedOnCurrentFunction currentFnNameWithModule rule =
   in not $ any (matchNamesWithAsterisk AsteriskInSecond currentFnNameWithModule) ignoredFunctions
 
 -- Create GHC compilation error from CompileError
-mkGhcCompileError :: CompileError -> (SrcSpan, OP.SDoc)
-mkGhcCompileError err = (src_span err, OP.text $ getErrMsgWithSuggestions (err_msg err) (suggested_fixes err))
+-- GHC 9.4+: addErr/addErrs take TcRnMessage, not SDoc. Wrap the same SDoc in an
+-- "unknown" diagnostic (behaviour: identical error text, same src span).
+mkGhcCompileError :: CompileError -> (SrcSpan, TcRnMessage)
+mkGhcCompileError err = (src_span err, mkTcRnUnknownMessage $ mkPlainError noHints $ OP.text $ getErrMsgWithSuggestions (err_msg err) (suggested_fixes err))
 
 -- Make error message with suggestion
 getErrMsgWithSuggestions :: String -> Suggestions -> String
@@ -968,8 +976,8 @@ getErrMsgWithSuggestions errMsg suggestions = errMsg
     sixSpaces = twoSpaces <> fourSpaces
 
 -- Create invalid yaml file compilation error
-mkInvalidYamlFileErr :: String -> OP.SDoc
-mkInvalidYamlFileErr err = OP.text err
+mkInvalidYamlFileErr :: String -> TcRnMessage
+mkInvalidYamlFileErr err = mkTcRnUnknownMessage $ mkPlainError noHints $ OP.text err
 
 -- Create Internal Representation of Logging Error
 mkCompileError :: String -> (LHsExpr GhcTc, Violation) -> TcM CompileError
@@ -1029,13 +1037,15 @@ getArgTypeWrapper expr@(L _ (OpApp _ lfun op rfun)) =
     "(<>)" -> getArgTypeWrapper lfun
     _ -> getArgType op True
 getArgTypeWrapper (L loc (PatHsWrap _ expr)) = getArgTypeWrapper (L loc expr)
-getArgTypeWrapper (L loc (HsPar _ expr)) = getArgTypeWrapper expr
+getArgTypeWrapper (L loc (HsPar _ _ expr _)) = getArgTypeWrapper expr
 getArgTypeWrapper expr = getArgType expr False
 
 -- [DEPRECATED] Get LHsExpr type
 getArgType :: LHsExpr GhcTc -> Bool -> [Type]
 getArgType (L _ (HsLit _ v)) _ = getLitType v
-getArgType (L _ (HsOverLit _ (OverLit (OverLitTc _ typ) v _))) _ = [typ]
+-- GHC 9.4: ol_witness moved into OverLitTc, so OverLit has 2 fields and
+-- OverLitTc has 3 (rebindable, witness, type). typ is still ol_type.
+getArgType (L _ (HsOverLit _ (OverLit (OverLitTc _ _ typ) v))) _ = [typ]
 getArgType (L loc (PatHsWrap _ expr)) shouldReturnFinalType = getArgType (L loc expr) shouldReturnFinalType
 getArgType (L loc (HsApp _ lfun rfun)) shouldReturnFinalType = getArgType lfun shouldReturnFinalType
 getArgType arg shouldReturnFinalType = 

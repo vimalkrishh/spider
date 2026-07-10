@@ -26,7 +26,9 @@ import GHC.Driver.Backpack.Syntax
 import GHC.Unit.Info
 -- import Streamly.Internal.Data.Stream (fromList,mapM_,mapM,toList)
 import GHC hiding (typeKind)
-import GHC.Driver.Plugins (Plugin(..),CommandLineOption,defaultPlugin,PluginRecompile(..))
+import GHC.Driver.Plugins (Plugin(..),CommandLineOption,defaultPlugin,PluginRecompile(..),ParsedResult(..))
+import GHC.Driver.Errors.Types (ghcUnknownMessage)
+import GHC.Utils.Error (mkErrorMsgEnvelope)
 import GHC.Driver.Env
 import GHC.Tc.Types
 import GHC.Unit.Module.ModSummary
@@ -46,6 +48,11 @@ import GHC.Core.TyCo.Rep
 import GHC.Data.FastString
 import GHC.IO (unsafePerformIO)
 import qualified GHC.Utils.Ppr as Pretty
+import GHC.Hs.DocString (renderHsDocString, mkGeneratedHsDocString)
+import GHC.Hs.Doc (hsDocString)
+import GHC.Tc.Errors.Types (mkTcRnUnknownMessage)
+import qualified Data.Foldable as Fold
+import System.Environment (lookupEnv)
 #else
 import qualified Pretty as Pretty
 import qualified TcRnMonad as TCError
@@ -231,15 +238,18 @@ showSDocUnsafe' = showSDocUnsafe . ppr
 defaultCliOptions :: CliOptions
 defaultCliOptions = CliOptions {path="./.juspay/api-contract/",port=4444,host="::1",log=False,tc_funcs=Just False,api_contract=Just True}
 
-collectTypeInfoParser :: [CommandLineOption] -> ModSummary -> HsParsedModule -> Hsc HsParsedModule
-collectTypeInfoParser opts modSummary hpm = do
+-- GHC 9.6: parsedResultAction receives/returns a ParsedResult (wrapping the
+-- HsParsedModule + parser messages). Unwrap it, do the same work, return it as-is.
+collectTypeInfoParser :: [CommandLineOption] -> ModSummary -> ParsedResult -> Hsc ParsedResult
+collectTypeInfoParser opts modSummary hsParsedResult = do
     let cliOptions = case opts of
                     [] ->  defaultCliOptions
                     (local : _) ->
                                 case A.decode $ BL.fromStrict $ encodeUtf8 $ T.pack local of
                                     Just (val :: CliOptions) -> val
                                     Nothing -> defaultCliOptions
-    let prefixPath = "./.juspay/api-contract/"
+    let hpm = parsedResultModule hsParsedResult
+        prefixPath = "./.juspay/api-contract/"
         moduleName' = moduleNameString $ moduleName $ ms_mod modSummary
         modulePath = prefixPath <> msHsFilePath modSummary
         moduleSrcSpan = mkFileSrcSpan $ ms_location modSummary
@@ -271,9 +281,13 @@ collectTypeInfoParser opts modSummary hpm = do
                 (eitherTypeRules :: Either (YAML.ParseException) (HashMapL TypeRule)) <- liftIO $ fetchRules (modulePath <> ".yaml")
                 case eitherTypeRules of
 #if __GLASGOW_HASKELL__ >= 900
+                    -- GHC 9.4+: throwErrors takes Messages GhcMessage; mkErr/mkDecorated
+                    -- replaced by mkErrorMsgEnvelope + an "unknown" GhcMessage wrapping the
+                    -- same SDoc (identical error text and span).
                     Left err -> ParseError.throwErrors
+                                $ ParseError.mkMessages
                                 $ listToBag
-                                    $ [ParseError.mkErr moduleSrcSpan reallyAlwaysQualify (ParseError.mkDecorated [docToSDoc $ Pretty.text $ (modulePath <> ".yaml") <> " is missing for this module : " <> show err])]
+                                    $ [mkErrorMsgEnvelope moduleSrcSpan reallyAlwaysQualify (ghcUnknownMessage $ ParseError.mkPlainError ParseError.noHints (docToSDoc $ Pretty.text $ (modulePath <> ".yaml") <> " is missing for this module : " <> show err))]
 #else
                     Left err -> ParseError.throwErrors
                                 $ listToBag
@@ -302,7 +316,7 @@ collectTypeInfoParser opts modSummary hpm = do
                         if (not $ Prelude.null $ errorsNubbed)
                             then do
 #if __GLASGOW_HASKELL__ >= 900
-                                errorMessages <- pure $ listToBag $ map (\(srcSpan,errorMessage) -> ParseError.mkErr srcSpan reallyAlwaysQualify (ParseError.mkDecorated [docToSDoc $ Pretty.text $ generateErrorMessage (modulePath <> ".yaml") errorMessage])) errorsNubbed
+                                errorMessages <- pure $ ParseError.mkMessages $ listToBag $ map (\(srcSpan,errorMessage) -> mkErrorMsgEnvelope srcSpan reallyAlwaysQualify (ghcUnknownMessage $ ParseError.mkPlainError ParseError.noHints (docToSDoc $ Pretty.text $ generateErrorMessage (modulePath <> ".yaml") errorMessage))) errorsNubbed
                                 ParseError.throwErrors errorMessages
 #else
                                 errorMessages <- 
@@ -314,7 +328,7 @@ collectTypeInfoParser opts modSummary hpm = do
                                 ParseError.throwErrors errorMessages
 #endif
                             else pure ()
-    pure hpm
+    pure hsParsedResult
 
 #if __GLASGOW_HASKELL__ >= 900
 instance (YAML.ToJSON v) => YAML.ToJSON (OMap.OMap HM.Key v) where
@@ -356,7 +370,7 @@ collectInstanceInfo opts modSummary tcEnv = do
         newModuleList <- liftIO $ readMVar newModuleListMvar
         case eitherTypeRules of
 #if __GLASGOW_HASKELL__ >= 900
-            Left err -> TCError.addErrs $ [(moduleSrcSpan,docToSDoc $ Pretty.text $ (modulePath <> ".yaml") <> " " <> "is missing for this module :" <> show err)]
+            Left err -> TCError.addErrs $ [(moduleSrcSpan, mkTcRnUnknownMessage $ ParseError.mkPlainError ParseError.noHints $ docToSDoc $ Pretty.text $ (modulePath <> ".yaml") <> " " <> "is missing for this module :" <> show err)]
 #else
             Left err -> TCError.addErrs $ [(moduleSrcSpan,docToSDoc $ Pretty.text $ (modulePath <> ".yaml") <> " " <> "is missing for this module :" <> show err)]
 #endif
@@ -413,7 +427,7 @@ collectInstanceInfo opts modSummary tcEnv = do
                         if (not $ Prelude.null $ errorsNubbed)
                             then do
 #if __GLASGOW_HASKELL__ >= 900
-                                TCError.addErrs $ map (\(srcSpan,errorMessage) -> (srcSpan,docToSDoc $ Pretty.text $ generateErrorMessage (modulePath <> ".yaml") errorMessage)) errorsNubbed
+                                TCError.addErrs $ map (\(srcSpan,errorMessage) -> (srcSpan, mkTcRnUnknownMessage $ ParseError.mkPlainError ParseError.noHints $ docToSDoc $ Pretty.text $ generateErrorMessage (modulePath <> ".yaml") errorMessage)) errorsNubbed
 #else
                                 TCError.addErrs $ map (\(srcSpan,errorMessage) -> (srcSpan,docToSDoc $ Pretty.text $ generateErrorMessage (modulePath <> ".yaml") errorMessage)) errorsNubbed
 #endif
@@ -424,7 +438,7 @@ collectInstanceInfo opts modSummary tcEnv = do
 
 processInstance :: LHsBindLR GhcTc GhcTc -> IO [(SrcSpan,String,String,InstanceFromTC)]
 #if __GLASGOW_HASKELL__ >= 900
-processInstance (L l (FunBind _ id' matches _)) = do
+processInstance (L l (FunBind _ id' matches)) = do
 #else
 processInstance (L l (FunBind _ id' matches _ _)) = do
 #endif
@@ -439,7 +453,7 @@ processInstance (L l (FunBind _ id' matches _ _)) = do
     else pure mempty
 processInstance (L _ (VarBind{var_id = var, var_rhs = expr})) = pure mempty
 processInstance (L _ (PatBind{pat_lhs = pat, pat_rhs = expr})) = pure mempty
-processInstance (L _ (AbsBinds{abs_binds = binds})) = do
+processInstance (L _ (XHsBindsLR (AbsBinds{abs_binds = binds}))) = do
   res <- toList $ mapM processInstance $ fromList $ bagToList binds
   pure $ Prelude.concat res
 processInstance _ = pure mempty
@@ -486,22 +500,16 @@ getAppliedOnTypeName "toXML" (FunTy _  arg res) = Just $ (showSDocUnsafe $ ppr a
 getAppliedOnTypeName _ _ = Nothing
 #endif
 
-processHsSplice (HsTypedSplice _ _ name expr) = do
-    -- when (generateTypesRules) $ print ("HsTypedSplice",showSDocUnsafe $ ppr name , showSDocUnsafe $ ppr expr)
-    pure mempty
-processHsSplice (HsUntypedSplice _ _ name expr) = do
+-- GHC 9.6: HsSplice was split up. A declaration splice now carries an
+-- HsUntypedSplice (HsUntypedSpliceExpr for $(..) / HsQuasiQuote for [q|..|]);
+-- HsTypedSplice and HsSpliced no longer occur here. The name quote ''Foo that
+-- the old code found via the "HsBracket" constructor is now "HsUntypedBracket".
+processHsSplice (HsUntypedSpliceExpr _ expr) = do
     let types = expr ^? biplateRef :: [HsExpr GhcPs]
-        typeName = map (\(_,y) -> replace "''" "" y) $ Prelude.filter (\(const,_) -> const `Prelude.elem` ["HsBracket"]) $ map (\x -> (show $ toConstr x,showSDocUnsafe $ ppr x)) types
+        typeName = map (\(_,y) -> replace "''" "" y) $ Prelude.filter (\(const,_) -> const `Prelude.elem` ["HsUntypedBracket"]) $ map (\x -> (show $ toConstr x,showSDocUnsafe $ ppr x)) types
         possibleInstances = map (\(_,y) -> y) $ Prelude.filter (\(const,_) -> const `Prelude.elem` ["HsVar"]) $ map (\x -> (show $ toConstr x,showSDocUnsafe $ ppr x)) types
     pure $ Prelude.concat $ map (\x -> map (\y -> (y,x)) possibleInstances) typeName
-processHsSplice (HsQuasiQuote _ id1 id2 srcSpan fs) = do
-    -- when (generateTypesRules) $ print ("HsQuasiQuote",showSDocUnsafe $ ppr id1 , showSDocUnsafe $ ppr id2)
-    pure mempty
-processHsSplice (HsSpliced _ _ expr) = do
-    -- case expr of
-        -- (HsSplicedExpr expr' ) -> when (generateTypesRules) $ print (showSDocUnsafe $ ppr expr')
-        -- (HsSplicedTy   type_ ) -> when (generateTypesRules) $ print (showSDocUnsafe $ ppr type_)
-        -- (HsSplicedPat  pat)    -> when (generateTypesRules) $ print (showSDocUnsafe $ ppr pat)
+processHsSplice (HsQuasiQuote _ _ _) = do
     pure mempty
 
 #if __GLASGOW_HASKELL__ >= 900
@@ -585,7 +593,7 @@ getTypeInfo (L l (TyClD _ (DataDecl _ lname _ _ defn))) =
     { typeKind = "data"
     , caseType = Nothing
     , instances = mempty
-    , dataConstructors = Map.fromList $ map getDataConInfo (dd_cons defn)
+    , dataConstructors = Map.fromList $ map getDataConInfo (Fold.toList (dd_cons defn))
     })]
 getTypeInfo (L l (TyClD _ (SynDecl _ lname _ _ rhs))) =
     [(locA' l ,showSDocUnsafe' lname,TypeRule
@@ -593,7 +601,7 @@ getTypeInfo (L l (TyClD _ (SynDecl _ lname _ _ rhs))) =
     , caseType = Nothing
     , instances = mempty
 #if __GLASGOW_HASKELL__ >= 900
-    , dataConstructors = Map.singleton (showSDocUnsafe' lname) (DataConInfo  (maybe mempty (Map.singleton "synonym" . unpackHDS) (hsTypeToString $ unLoc rhs)) [])
+    , dataConstructors = Map.singleton (showSDocUnsafe' lname) (DataConInfo  (maybe mempty (Map.singleton "synonym" . renderHsDocString) (hsTypeToString $ unLoc rhs)) [])
 #else
     , dataConstructors = Map.singleton (showSDocUnsafe' lname) (DataConInfo (Map.singleton "synonym" ((showSDocUnsafe . ppr . unLoc) rhs)) [])
 #endif
@@ -607,10 +615,10 @@ getDataConInfo (L _ ConDeclH98{ con_name = lname, con_args = args }) =
       , sumTypes = [] -- For H98-style data constructors, sum types are not applicable
       })
 getDataConInfo (L _ ConDeclGADT{ con_names = lnames, con_res_ty = ty }) =
-  (intercalate ", " (map showSDocUnsafe' lnames),DataConInfo
+  (intercalate ", " (map showSDocUnsafe' (Fold.toList lnames)),DataConInfo
     {
 #if __GLASGOW_HASKELL__ >= 900
-    fields' = maybe (mempty) (\x -> Map.singleton "gadt" $ unpackHDS x) (hsTypeToString $ unLoc ty)
+    fields' = maybe (mempty) (\x -> Map.singleton "gadt" $ renderHsDocString x) (hsTypeToString $ unLoc ty)
 #else
     fields' = Map.singleton "gadt" (showSDocUnsafe $ ppr ty)
 #endif
@@ -622,9 +630,9 @@ hsTypeToString :: HsType GhcPs -> Maybe HsDocString
 hsTypeToString = f
   where
     f :: HsType GhcPs -> Maybe HsDocString
-    f (HsDocTy _ _ lds) = Just (unLoc lds)
-    f (HsBangTy _ _ (L _ (HsDocTy _ _ lds))) = Just (unLoc lds)
-    f x = Just (mkHsDocString $ showSDocUnsafe $ ppr x)
+    f (HsDocTy _ _ lds) = Just (hsDocString (unLoc lds))
+    f (HsBangTy _ _ (L _ (HsDocTy _ _ lds))) = Just (hsDocString (unLoc lds))
+    f x = Just (mkGeneratedHsDocString $ showSDocUnsafe $ ppr x)
 
 extractInfixCon :: [HsType GhcPs] -> Map.Map String String
 extractInfixCon x =
@@ -644,7 +652,7 @@ extractConDeclField x = Map.fromList (go x)
     go ((ConDeclField _ cd_fld_names cd_fld_type _):xs) =
         [((intercalate "," $ convertRdrNameToString cd_fld_names),(showSDocUnsafe $ ppr cd_fld_type))] <> (go xs)
 
-    convertRdrNameToString x = map (showSDocUnsafe . ppr . rdrNameOcc . unLoc . reLocN . rdrNameFieldOcc . unLoc') x
+    convertRdrNameToString x = map (showSDocUnsafe . ppr . rdrNameOcc . unLoc . reLocN . foLabel . unLoc') x
 
 getFieldMap :: HsConDeclH98Details GhcPs -> Map.Map String String
 getFieldMap con_args =

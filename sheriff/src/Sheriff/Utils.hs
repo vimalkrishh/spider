@@ -18,7 +18,7 @@ import Data.Data (Data)
 import Data.Generics.Uniplate.Data
 import qualified Data.HashMap.Strict as HM
 import Data.List.Extra (splitOn, trim, isInfixOf)
-import Data.Maybe (maybe)
+import Data.Maybe (maybe, fromMaybe)
 import qualified Data.Text as T
 import Data.Yaml
 import GHC hiding (exprType)
@@ -214,9 +214,9 @@ getLitType (HsInteger _ _ _) = [intTy]
 getLitType (HsRat _ _ _) = [doubleTy]
 getLitType (HsFloatPrim _ _) = [floatTy]
 getLitType (HsDoublePrim _ _) = [doubleTy]
-#if __GLASGOW_HASKELL__ < 900
+-- Catch-all for the (uninhabited-at-GhcTc) XLit extension and any other
+-- literal; returns [] as the pre-9.8 code did for unlisted constructors.
 getLitType _ = []
-#endif
 
 -- Check if 1st array has any element in 2nd array
 hasAny :: Eq a => [a]           -- ^ List of elements to look for
@@ -275,12 +275,15 @@ extractSrcSpanSegment srcSpan filePath oldCode = case extractRealSrcSpan srcSpan
             -- Extract relevant lines
             relevantLines = take (endLine - startLine + 1) $ drop (startLine - 1) fileLines
             -- Handle single-line and multi-line spans
+            -- GHC 9.8 makes head/tail -Werror (-Wx-partial); pattern-match instead.
+            -- This branch is only reached when there are >= 2 lines, so firstLine
+            -- and restLines below are exactly the old head/tail relevantLines.
             result = case relevantLines of
                         [] -> ""
                         [singleLine] -> T.take (endCol - startCol) $ T.drop (startCol - 1) singleLine
-                        _ -> T.unlines $ [T.drop (startCol - 1) (head relevantLines)] ++
-                                        (init (tail relevantLines)) ++
-                                        [T.take endCol (last relevantLines)]
+                        (firstLine : restLines) -> T.unlines $ [T.drop (startCol - 1) firstLine] ++
+                                        (init restLines) ++
+                                        [T.take endCol (last restLines)]
         pure $ T.unpack result
   _ -> pure oldCode
 
@@ -305,8 +308,10 @@ traverseConditionalUni p (x : xs) =
 -- Get type for a LHsExpr GhcTc
 getHsExprType :: Bool -> LHsExpr GhcTc -> TcM Type
 getHsExprType logTypeDebugging expr = do
-  coreExpr <- initDsTc $ dsLExpr expr
-  let typ = exprType coreExpr
+  -- GHC 9.4: initDsTc now returns (Messages, Maybe CoreExpr); desugaring a
+  -- typechecked expr succeeds, so extract Just (old API returned CoreExpr directly).
+  (_, mbCoreExpr) <- initDsTc $ dsLExpr expr
+  let typ = exprType (fromMaybe (panic "getHsExprType: dsLExpr failed") mbCoreExpr)
   when logTypeDebugging $ liftIO . print $ "DebugType = " <> (debugPrintType typ)
   pure typ
 
@@ -323,7 +328,9 @@ getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg typ = case ty
   TyConApp tycon tys -> [NestedTy $ [TextTy $ getNameWithModuleName (tyConName tycon)] <> (concat $ fmap (getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg) tys)]
   AppTy ty1 ty2 -> getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg ty1 <> getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg ty2
   ForAllTy _ ty -> getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg ty
-  PatFunTy anonArgFlag ty1 ty2 -> bool (getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg ty1 <> getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg ty2) (getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg ty2) (ignoreConstraintArg && anonArgFlag == InvisArg)
+  -- GHC 9.6: AnonArgFlag/InvisArg removed; isInvisibleFunArg is the behaviour-
+  -- preserving test for an invisible (constraint/dictionary) function argument.
+  PatFunTy anonArgFlag ty1 ty2 -> bool (getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg ty1 <> getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg ty2) (getHsExprTypeAsTypeDataListWithConstraintCheck ignoreConstraintArg ty2) (ignoreConstraintArg && isInvisibleFunArg anonArgFlag)
   _ -> []
 
 -- Get Qualified Types as List Ignoring constraint checks
@@ -387,7 +394,7 @@ getHsExprTypeGeneric logTypeDebugging expr = case ghcPass @p of
       pure (Just typ)
     GhcTc -> do
       e <- getEnv
-      typ <- liftIO $ runIOEnv e $ exprType <$> initDsTc (dsLExpr expr)
+      typ <- liftIO $ runIOEnv e $ (exprType . fromMaybe (panic "getHsExprTypeGeneric: dsLExpr failed") . snd) <$> initDsTc (dsLExpr expr)
       when logTypeDebugging $ liftIO . print $ "DebugType = " <> (debugPrintType typ)
       pure (Just typ)
 
@@ -405,8 +412,8 @@ trfPatToSimpleTcExpr :: Pat GhcTc -> SimpleTcExpr
 trfPatToSimpleTcExpr pat = case pat of
   VarPat _ (L _ var)           -> SimpleVar var
   LazyPat _ (L _ lPat)         -> trfPatToSimpleTcExpr lPat
-  AsPat _ (L _ var) (L _ sPat) -> SimpleAliasPat (SimpleVar var) (trfPatToSimpleTcExpr sPat)
-  ParPat _ (L _ sPat)          -> trfPatToSimpleTcExpr sPat
+  AsPat _ (L _ var) _ (L _ sPat) -> SimpleAliasPat (SimpleVar var) (trfPatToSimpleTcExpr sPat)
+  ParPat _ _ (L _ sPat) _        -> trfPatToSimpleTcExpr sPat
   BangPat _ (L _ sPat)         -> trfPatToSimpleTcExpr sPat
   SigPat _ (L _ sPat) _        -> trfPatToSimpleTcExpr sPat
   ListPat _ lPatList           -> SimpleList (fmap (trfPatToSimpleTcExpr . unLoc) lPatList)
@@ -426,10 +433,12 @@ trfPatToSimpleTcExpr pat = case pat of
 trfLHsExprToSimpleTcExpr :: LHsExpr GhcTc -> SimpleTcExpr
 trfLHsExprToSimpleTcExpr (L loc hsExpr) = case hsExpr of
   HsVar _ (L _ var)            -> SimpleVar var
-  HsConLikeOut _ cl            -> SimpleDataCon (conLikeWrapId cl) []
+  -- GHC 9.6: HsConLikeOut removed; a saturated ConLike is now XExpr (ConLikeTc ..).
+  XExpr (ConLikeTc cl _ _)     -> SimpleDataCon (conLikeWrapId cl) []
   HsLit _ lit                  -> SimpleLit lit
-  HsPar _ expr                 -> trfLHsExprToSimpleTcExpr expr
-  HsAppType _ expr _           -> trfLHsExprToSimpleTcExpr expr
+  -- GHC 9.6: HsPar/HsAppType gained token fields.
+  HsPar _ _ expr _             -> trfLHsExprToSimpleTcExpr expr
+  HsAppType _ expr _ _         -> trfLHsExprToSimpleTcExpr expr
   PatHsWrap _ expr             -> trfLHsExprToSimpleTcExpr (L loc expr)
   ExplicitTuple _ ls _         -> SimpleTuple (fmap trfTupleArg ls)
   PatExplicitList _ ls         -> SimpleList (fmap trfLHsExprToSimpleTcExpr ls)
@@ -438,7 +447,7 @@ trfLHsExprToSimpleTcExpr (L loc hsExpr) = case hsExpr of
   PatHsExpansion _ expanded    -> trfLHsExprToSimpleTcExpr (L loc expanded)
 #endif
   HsOverLit _ (OverLit{ol_val = overloadedLit}) -> SimpleOverloadedLit overloadedLit
-  HsApp _ (L _ (HsConLikeOut _ cl)) funr -> SimpleDataCon (conLikeWrapId cl) [trfLHsExprToSimpleTcExpr funr]
+  HsApp _ (L _ (XExpr (ConLikeTc cl _ _))) funr -> SimpleDataCon (conLikeWrapId cl) [trfLHsExprToSimpleTcExpr funr]
   HsApp _ funl funr -> 
     case trfLHsExprToSimpleTcExpr funl of
       SimpleDataCon mbVar ls -> SimpleDataCon mbVar (ls ++ [trfLHsExprToSimpleTcExpr funr])
