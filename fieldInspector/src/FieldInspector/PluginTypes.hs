@@ -95,17 +95,20 @@ import System.Directory (createDirectoryIfMissing, removeFile)
 import System.Directory.Internal.Prelude hiding (mapM, mapM_,log)
 import Prelude hiding (id, mapM_,log)
 import Control.Exception (evaluate)
--- Only used under the ENABLE_LR_PLUGINS block below; importing them unconditionally
--- dragged large-anon's orphan `Outputable (GenLocated l e)` into scope, overlapping
--- GHC's own instance and breaking `ppr` on GhcPs AST in euler-hs's package set.
--- (RDP is used unconditionally, so its import stays. Biplate instances come from the
+-- These record plugins are only bundled into the combined plugin under the
+-- ENABLE_LR_PLUGINS block below. Importing them unconditionally (a) dragged
+-- large-anon's orphan `Outputable (GenLocated l e)` into scope (overlaps GHC's
+-- instance, breaks `ppr` on GhcPs AST in euler-hs's set), and (b) bundling RDP
+-- re-ran RecordDotPreprocessor on consumers that already run it standalone
+-- (e.g. euler-hs), producing duplicate HasField instances. Gate imports + usage
+-- so the default build bundles none of them. (Biplate instances come from the
 -- Data.Generics.Uniplate.Data import above, not from these.)
 #if defined(ENABLE_LR_PLUGINS)
 import qualified Data.Record.Plugin as DRP
 import qualified Data.Record.Anon.Plugin as DRAP
 import qualified Data.Record.Plugin.HasFieldPattern as DRPH
-#endif
 import qualified RecordDotPreprocessor as RDP
+#endif
 import qualified ApiContract.Plugin as ApiContract
 -- import qualified Fdep.Plugin as Fdep
 import qualified Data.ByteString.Lazy as BL
@@ -134,8 +137,8 @@ plugin = (defaultPlugin{
         <> DRP.plugin
         <> DRAP.plugin
         <> DRPH.plugin
-#endif
         <> RDP.plugin
+#endif
 
 instance Semigroup Plugin where
   p <> q = defaultPlugin {
