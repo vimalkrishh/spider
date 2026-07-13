@@ -1,149 +1,72 @@
-From 572319f45850f01ba2ebd60205647f7c32eb039a Mon Sep 17 00:00:00 2001
-From: Adithya Kumar <adithya@composewell.com>
-Date: Wed, 29 Nov 2023 22:24:34 +0530
+From f06be801bedafa4e46845bc6ab5e8842ec7c94e2 Mon Sep 17 00:00:00 2001
+From: Kiransai Abhishek <kiransai.abhishek@juspay.in>
+Date: Fri, 10 Jul 2026 12:00:00 +0530
 Subject: [PATCH] Add a primop to get the thread statistics
 
+Rebased from GHC 9.2.8 onto GHC 9.8.4.
 ---
- BUILD-NOTES.txt                     |  83 +++++++++++++++++
  compiler/GHC/Builtin/primops.txt.pp |   6 ++
  compiler/GHC/StgToCmm/Prim.hs       |   1 +
+ compiler/GHC/StgToJS/Prim.hs        |   1 +
  configure.ac                        |   2 +-
- includes/rts/storage/TSO.h          |   8 ++
- includes/stg/MiscClosures.h         |   1 +
- rts/PrimOps.cmm                     |  37 ++++++++
+ rts/PrimOps.cmm                     |  36 +++++++
  rts/RtsSymbols.c                    |   1 +
  rts/Schedule.c                      | 139 ++++++++++++++++++++++++++++
  rts/Schedule.h                      |   8 ++
  rts/Threads.c                       |   5 +
+ rts/include/rts/storage/TSO.h       |   8 ++
+ rts/include/stg/MiscClosures.h      |   1 +
  rts/sm/Storage.c                    |  24 +++++
  rts/sm/Storage.h                    |   3 +
- utils/deriveConstants/Main.hs       |   7 +-
- 14 files changed, 323 insertions(+), 2 deletions(-)
- create mode 100644 BUILD-NOTES.txt
+ utils/deriveConstants/Main.hs       |   6 ++
+ 14 files changed, 240 insertions(+), 1 deletion(-)
 
-diff --git a/BUILD-NOTES.txt b/BUILD-NOTES.txt
-new file mode 100644
-index 0000000000..eb39226ad7
---- /dev/null
-+++ b/BUILD-NOTES.txt
-@@ -0,0 +1,83 @@
-+ghcup install ghc 9.0.2
-+ghcup set ghc 9.0.2
-+cabal install alex-3.4.0.0
-+cabal install happy-1.20.0
-+export PATH=~/.cabal/bin:$PATH
-+git clone https://gitlab.haskell.org/harendra/ghc.git
-+cd ghc
-+git checkout ghc-9.2.8-develop
-+git submodule update --init --recursive
-+cp mk/build.mk.sample mk/build.mk
-+# Uncomment "BuildFlavour = quick" line in mk/build.mk
-+# sudo apt-get install autotools-dev
-+# sudo apt-get install autoconf
-+# sudo apt-get install libncurses5-dev
-+./boot
-+./configure
-+make
-+./inplace/bin/ghc-stage2
-+make binary-dist # This will fail if autoreconf version is too recent (Use 2.69)
-+
-+# For faster incremental builds after changes,
-+# uncomment "stage = 2" line in mk/build.mk
-+
-+# Ensure nix-profile is not in PATH to avoid any nix related issues
-+
-+# Find alex and happy versions required from aclocal.m4
-+# GHC builds often fail because of incorrect happy versions
-+# Need to find the correct one if the build fails
-+A working configure output:
-+
-+----------------------------------------------------------------------
-+Configure completed successfully.
-+
-+   Building GHC version  : 9.2.8.20231129
-+          Git commit id  : 4999d2a61b35f185c285ca73bf8a767a4f35133f
-+
-+   Build platform        : x86_64-unknown-linux
-+   Host platform         : x86_64-unknown-linux
-+   Target platform       : x86_64-unknown-linux
-+
-+   Bootstrapping using   : /home/adithya/.ghcup/bin/ghc
-+      which is version   : 9.0.2
-+      with threaded RTS? : YES
-+
-+   Using (for bootstrapping) : gcc
-+   Using gcc                 : cc
-+      which is version       :
-+      linker options         : -fuse-ld=gold
-+   Building a cross compiler : NO
-+   Unregisterised            : NO
-+   TablesNextToCode          : YES
-+   Build GMP in tree         : NO
-+   hs-cpp       : cc
-+   hs-cpp-flags : -E -undef -traditional
-+   ar           : ar
-+   ld           : ld.gold
-+   nm           : nm
-+   libtool      :
-+   objdump      : objdump
-+   ranlib       : ranlib
-+   otool        :
-+   install_name_tool :
-+   windres      :
-+   dllwrap      :
-+   genlib       :
-+   Happy        : /home/adithya/.cabal/bin/happy (1.20.0)
-+   Alex         : /home/adithya/.cabal/bin/alex (3.4.0.0)
-+   sphinx-build :
-+   xelatex      :
-+   makeinfo     :
-+   git          : /usr/bin/git
-+
-+   Using LLVM tools
-+      clang :
-+      llc   :
-+      opt   :
-+
-+   HsColour was not found; documentation will not contain source links
-+
-+   Tools to build Sphinx HTML documentation available: NO
-+   Tools to build Sphinx PDF documentation available: NO
-+   Tools to build Sphinx INFO documentation available: NO
-+----------------------------------------------------------------------
 diff --git a/compiler/GHC/Builtin/primops.txt.pp b/compiler/GHC/Builtin/primops.txt.pp
-index 611869c1e0..a1af44e189 100644
+index 0838116..5a10c66 100644
 --- a/compiler/GHC/Builtin/primops.txt.pp
 +++ b/compiler/GHC/Builtin/primops.txt.pp
-@@ -2946,6 +2946,12 @@ primop  ThreadStatusOp "threadStatus#" GenPrimOp
+@@ -3219,6 +3219,12 @@ primop  ThreadStatusOp "threadStatus#" GenPrimOp
     out_of_line = True
     has_side_effects = True
  
 +primop  ThreadCPUTimeOp "threadCPUTime#" GenPrimOp
-+   State# RealWorld -> (# State# RealWorld, INT64, INT64, Int32#, Int32# #)
++   State# RealWorld -> (# State# RealWorld, Int64#, Int64#, Int32#, Int32# #)
 +   with
 +   out_of_line = True
 +   has_side_effects = True
 +
- ------------------------------------------------------------------------
- section "Weak pointers"
- ------------------------------------------------------------------------
+ primop ListThreadsOp "listThreads#" GenPrimOp
+    State# RealWorld -> (# State# RealWorld, Array# ThreadId# #)
+    { Returns an array of the threads started by the program. Note that this
 diff --git a/compiler/GHC/StgToCmm/Prim.hs b/compiler/GHC/StgToCmm/Prim.hs
-index 07d02d542d..790378fdf8 100644
+index edf5abf..a54d8d8 100644
 --- a/compiler/GHC/StgToCmm/Prim.hs
 +++ b/compiler/GHC/StgToCmm/Prim.hs
-@@ -1638,6 +1638,7 @@ emitPrimOp dflags primop = case primop of
-   IsCurrentThreadBoundOp -> alwaysExternal
+@@ -1615,6 +1615,7 @@ emitPrimOp cfg primop =
    NoDuplicateOp -> alwaysExternal
+   GetThreadLabelOp -> alwaysExternal
    ThreadStatusOp -> alwaysExternal
 +  ThreadCPUTimeOp -> alwaysExternal
    MkWeakOp -> alwaysExternal
    MkWeakNoFinalizerOp -> alwaysExternal
    AddCFinalizerToWeakOp -> alwaysExternal
+diff --git a/compiler/GHC/StgToJS/Prim.hs b/compiler/GHC/StgToJS/Prim.hs
+index 77ba4cf..119c2d4 100644
+--- a/compiler/GHC/StgToJS/Prim.hs
++++ b/compiler/GHC/StgToJS/Prim.hs
+@@ -878,6 +878,7 @@ genPrim prof bound ty op = case op of
+   IsCurrentThreadBoundOp -> \[r] []        -> PrimInline $ r |= one_
+   NoDuplicateOp          -> \[] []         -> PrimInline mempty -- don't need to do anything as long as we have eager blackholing
+   ThreadStatusOp         -> \[stat,cap,locked] [tid] -> PrimInline $ appT [stat, cap, locked] "h$threadStatus" [tid]
++  ThreadCPUTimeOp        -> unhandledPrimop op
+   ListThreadsOp          -> \[r] [] -> PrimInline $ appT [r] "h$listThreads" []
+   GetThreadLabelOp       -> \[r1, r2] [t]  -> PrimInline $ appT [r1, r2] "h$getThreadLabel" [t]
+   LabelThreadOp          -> \[] [t,l]      -> PrimInline $ t .^ "label" |= l
 diff --git a/configure.ac b/configure.ac
-index 31dd8a89b2..21658872d5 100644
+index 9c7faba..af8b806 100644
 --- a/configure.ac
 +++ b/configure.ac
-@@ -20,7 +20,7 @@ AC_INIT([The Glorious Glasgow Haskell Compilation System], [9.2.8], [glasgow-has
+@@ -22,7 +22,7 @@ AC_INIT([The Glorious Glasgow Haskell Compilation System], [9.8.4], [glasgow-has
  AC_CONFIG_MACRO_DIRS([m4])
  
  # Set this to YES for a released version, otherwise NO
@@ -152,42 +75,11 @@ index 31dd8a89b2..21658872d5 100644
  
  # The primary version (e.g. 7.5, 7.4.1) is set in the AC_INIT line
  # above.  If this is not a released version, then we will append the
-diff --git a/includes/rts/storage/TSO.h b/includes/rts/storage/TSO.h
-index 8bace9492c..cffaeb919e 100644
---- a/includes/rts/storage/TSO.h
-+++ b/includes/rts/storage/TSO.h
-@@ -183,6 +183,14 @@ typedef struct StgTSO_ {
-     StgWord32 saved_winerror;
- #endif
- 
-+    // Can this go in the thread cost centre stack or a similar data structure
-+    // for perf stats? We can enable the use of this using an RTS option.
-+    // See compiler/profiling/CostCentre.hs
-+    StgInt64 cur_sec;
-+    StgInt64 cur_nsec;
-+    StgInt32 count_thread_sched_out;
-+    StgInt32 cur_allocated;
-+
- } *StgTSOPtr; // StgTSO defined in rts/Types.h
- 
- /* Note [StgStack dirtiness flags and concurrent marking]
-diff --git a/includes/stg/MiscClosures.h b/includes/stg/MiscClosures.h
-index a988d55b05..a7c7cc6a30 100644
---- a/includes/stg/MiscClosures.h
-+++ b/includes/stg/MiscClosures.h
-@@ -530,6 +530,7 @@ RTS_FUN_DECL(stg_myThreadIdzh);
- RTS_FUN_DECL(stg_labelThreadzh);
- RTS_FUN_DECL(stg_isCurrentThreadBoundzh);
- RTS_FUN_DECL(stg_threadStatuszh);
-+RTS_FUN_DECL(stg_threadCPUTimezh);
- 
- RTS_FUN_DECL(stg_mkWeakzh);
- RTS_FUN_DECL(stg_mkWeakNoFinalizzerzh);
 diff --git a/rts/PrimOps.cmm b/rts/PrimOps.cmm
-index 96d94893a3..9c4cf2580b 100644
+index baa6487..817f748 100644
 --- a/rts/PrimOps.cmm
 +++ b/rts/PrimOps.cmm
-@@ -1106,6 +1106,43 @@ stg_threadStatuszh ( gcptr tso )
+@@ -1202,6 +1202,42 @@ stg_threadStatuszh ( gcptr tso )
      return (ret,cap,locked);
  }
  
@@ -201,10 +93,9 @@ index 96d94893a3..9c4cf2580b 100644
 +    // sec   = StgTSO_cur_sec(CurrentTSO);
 +    // nsec  = StgTSO_cur_nsec(CurrentTSO);
 +
-+    // sec = b64[CurrentTSO+120];
-+    // nsec = b64[CurrentTSO+128];
-+
-+    count_thread_sched_out = I32[CurrentTSO+136];
++    // Use the deriveConstants-generated accessor instead of a hardcoded
++    // struct offset, so this stays correct across GHC/TSO layout changes.
++    count_thread_sched_out = StgTSO_count_thread_sched_out(CurrentTSO);
 +
 +    //ccall traceThreadCPUTime(sec, nsec, SIZEOF_StgHeader+OFFSET_StgTSO_cur_nsec, SIZEOF_StgHeader);
 +
@@ -232,22 +123,22 @@ index 96d94893a3..9c4cf2580b 100644
   * TVar primitives
   * -------------------------------------------------------------------------- */
 diff --git a/rts/RtsSymbols.c b/rts/RtsSymbols.c
-index 534f30cd4c..1fc8d279e1 100644
+index 92d10a6..1ad8549 100644
 --- a/rts/RtsSymbols.c
 +++ b/rts/RtsSymbols.c
-@@ -974,6 +974,7 @@ extern char **environ;
-       SymI_HasProto(stg_takeMVarzh)                                     \
-       SymI_HasProto(stg_readMVarzh)                                     \
-       SymI_HasProto(stg_threadStatuszh)                                 \
-+      SymI_HasProto(stg_threadCPUTimezh)                                \
-       SymI_HasProto(stg_tryPutMVarzh)                                   \
-       SymI_HasProto(stg_tryTakeMVarzh)                                  \
-       SymI_HasProto(stg_tryReadMVarzh)                                  \
+@@ -876,6 +876,7 @@ extern char **environ;
+       SymI_HasDataProto(stg_takeMVarzh)                                     \
+       SymI_HasDataProto(stg_readMVarzh)                                     \
+       SymI_HasDataProto(stg_threadStatuszh)                                 \
++      SymI_HasDataProto(stg_threadCPUTimezh)                                \
+       SymI_HasDataProto(stg_tryPutMVarzh)                                   \
+       SymI_HasDataProto(stg_tryTakeMVarzh)                                  \
+       SymI_HasDataProto(stg_tryReadMVarzh)                                  \
 diff --git a/rts/Schedule.c b/rts/Schedule.c
-index ec32658fd1..001507782d 100644
+index 8f12429..27383f6 100644
 --- a/rts/Schedule.c
 +++ b/rts/Schedule.c
-@@ -189,6 +189,137 @@ static void deleteThread_(StgTSO *tso);
+@@ -183,6 +183,137 @@ static void deleteThread_(StgTSO *tso);
  
     ------------------------------------------------------------------------ */
  
@@ -385,7 +276,7 @@ index ec32658fd1..001507782d 100644
  static Capability *
  schedule (Capability *initialCapability, Task *task)
  {
-@@ -478,8 +609,13 @@ run_thread:
+@@ -477,8 +608,13 @@ run_thread:
      case ThreadRunGHC:
      {
          StgRegTable *r;
@@ -399,7 +290,7 @@ index ec32658fd1..001507782d 100644
          ret = r->rRet;
          break;
      }
-@@ -2454,6 +2590,7 @@ suspendThread (StgRegTable *reg, bool interruptible)
+@@ -2492,6 +2628,7 @@ suspendThread (StgRegTable *reg, bool interruptible)
    task = cap->running_task;
    tso = cap->r.rCurrentTSO;
  
@@ -407,7 +298,7 @@ index ec32658fd1..001507782d 100644
    traceEventStopThread(cap, tso, THREAD_SUSPENDED_FOREIGN_CALL, 0);
  
    // XXX this might not be necessary --SDM
-@@ -2553,6 +2690,8 @@ resumeThread (void *task_)
+@@ -2591,6 +2728,8 @@ resumeThread (void *task_)
  
      IF_DEBUG(sanity, checkTSO(tso));
  
@@ -417,12 +308,12 @@ index ec32658fd1..001507782d 100644
  }
  
 diff --git a/rts/Schedule.h b/rts/Schedule.h
-index 4c692842e7..c62b907ec2 100644
+index e4f17af..f13ba82 100644
 --- a/rts/Schedule.h
 +++ b/rts/Schedule.h
-@@ -24,6 +24,14 @@ void exitScheduler (bool wait_foreign);
+@@ -23,6 +23,14 @@ void initScheduler (void);
+ void exitScheduler (bool wait_foreign);
  void freeScheduler (void);
- void markScheduler (evac_fn evac, void *user);
  
 +// Primitive operation used to update the threadCPUTime prim-op
 +void updateThreadCPUTimePostPrim
@@ -436,10 +327,10 @@ index 4c692842e7..c62b907ec2 100644
  void scheduleThread (Capability *cap, StgTSO *tso);
  
 diff --git a/rts/Threads.c b/rts/Threads.c
-index 24c602a8de..41a5837399 100644
+index 46a70a1..7a7e992 100644
 --- a/rts/Threads.c
 +++ b/rts/Threads.c
-@@ -117,6 +117,11 @@ createThread(Capability *cap, W_ size)
+@@ -118,6 +118,11 @@ createThread(Capability *cap, W_ size)
      tso->prof.cccs = CCS_MAIN;
  #endif
  
@@ -451,11 +342,42 @@ index 24c602a8de..41a5837399 100644
      // put a stop frame on the stack
      stack->sp -= sizeofW(StgStopFrame);
      SET_HDR((StgClosure*)stack->sp,
+diff --git a/rts/include/rts/storage/TSO.h b/rts/include/rts/storage/TSO.h
+index 4ca1985..d0a1a45 100644
+--- a/rts/include/rts/storage/TSO.h
++++ b/rts/include/rts/storage/TSO.h
+@@ -188,6 +188,14 @@ typedef struct StgTSO_ {
+     StgWord32 saved_winerror;
+ #endif
+ 
++    // Can this go in the thread cost centre stack or a similar data structure
++    // for perf stats? We can enable the use of this using an RTS option.
++    // See compiler/profiling/CostCentre.hs
++    StgInt64 cur_sec;
++    StgInt64 cur_nsec;
++    StgInt32 count_thread_sched_out;
++    StgInt32 cur_allocated;
++
+ } *StgTSOPtr; // StgTSO defined in rts/Types.h
+ 
+ /* Note [StgStack dirtiness flags and concurrent marking]
+diff --git a/rts/include/stg/MiscClosures.h b/rts/include/stg/MiscClosures.h
+index 9d52d4b..4905775 100644
+--- a/rts/include/stg/MiscClosures.h
++++ b/rts/include/stg/MiscClosures.h
+@@ -549,6 +549,7 @@ RTS_FUN_DECL(stg_labelThreadzh);
+ RTS_FUN_DECL(stg_isCurrentThreadBoundzh);
+ RTS_FUN_DECL(stg_threadLabelzh);
+ RTS_FUN_DECL(stg_threadStatuszh);
++RTS_FUN_DECL(stg_threadCPUTimezh);
+ RTS_FUN_DECL(stg_listThreadszh);
+ 
+ RTS_FUN_DECL(stg_mkWeakzh);
 diff --git a/rts/sm/Storage.c b/rts/sm/Storage.c
-index f3591a88d3..72816ea706 100644
+index 424ab84..8d9a571 100644
 --- a/rts/sm/Storage.c
 +++ b/rts/sm/Storage.c
-@@ -1576,6 +1576,30 @@ calcTotalAllocated (void)
+@@ -1610,6 +1610,30 @@ calcTotalAllocated (void)
      return tot_alloc;
  }
  
@@ -487,7 +409,7 @@ index f3591a88d3..72816ea706 100644
  // Update the per-cap total_allocated numbers with an approximation of
  // the amount of memory used in each cap's nursery.
 diff --git a/rts/sm/Storage.h b/rts/sm/Storage.h
-index 69d13251bc..f168e60cdb 100644
+index e911d19..f28e0c9 100644
 --- a/rts/sm/Storage.h
 +++ b/rts/sm/Storage.h
 @@ -100,6 +100,9 @@ INLINE_HEADER void newNurseryBlock (bdescr *bd) {
@@ -501,10 +423,10 @@ index 69d13251bc..f168e60cdb 100644
     Stats 'n' DEBUG stuff
     -------------------------------------------------------------------------- */
 diff --git a/utils/deriveConstants/Main.hs b/utils/deriveConstants/Main.hs
-index 8bf8ae7b44..cfc7c34bc9 100644
+index d037199..053d7ea 100644
 --- a/utils/deriveConstants/Main.hs
 +++ b/utils/deriveConstants/Main.hs
-@@ -439,6 +439,12 @@ wanteds os = concat
+@@ -471,6 +471,12 @@ wanteds os = concat
            ,closureField_ Both "StgTSO_cccs" "StgTSO" "prof.cccs"
            ,closureField  Both "StgTSO"      "stackobj"
  
@@ -517,11 +439,6 @@ index 8bf8ae7b44..cfc7c34bc9 100644
            ,closureField       Both "StgStack" "sp"
            ,closureFieldOffset Both "StgStack" "stack"
            ,closureField       C    "StgStack" "stack_size"
-@@ -982,4 +988,3 @@ execute verbose prog args
-       ec <- rawSystem prog args
-       unless (ec == ExitSuccess) $
-           die ("Executing " ++ show prog ++ " failed")
--
 -- 
-2.17.1
+2.51.2
 

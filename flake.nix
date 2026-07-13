@@ -36,7 +36,7 @@
     ghc-hasfield-plugin.url = "github:eswar2001/ghc-hasfield-plugin/13887ab3f0d26bc724300521c012bf335e1945c6";
     ghc-hasfield-plugin.flake = false;
 
-    record-dot-preprocessor.url = "github:infinitumkiran/record-dot-preprocessor/98301c5c5f88f083e3e544d3ab246905c4996311";
+    record-dot-preprocessor.url = "github:AyushChaturvedi-7/record-dot-preprocessor/2b126423423fba113547f3a01bc66ef0cf38b263";
     record-dot-preprocessor.flake = false;
   };
 
@@ -85,11 +85,15 @@
           haskellProjects.default = {
             projectFlakeName = "spider";
             # NOTE: `warner` requires `ghc98-desugar-plugin` (the patched GHC that
-            # adds the `desugarResultAction` hook). The other packages build on
-            # stock `ghc98`, whose dependency closure is fully cached. Downstream
-            # repos build spider against euler's own patched GHC + cache, so this
-            # basePackages choice only governs spider's standalone build.
-            basePackages = pkgs.haskell.packages.ghc98;
+            # adds the `desugarResultAction` hook), so it is the project-wide base.
+            # The patch set/order matches euler-nix-common's `ghc98-perf-events`
+            # exactly (see ./ghc-patches), so the compiler derivation is identical
+            # to euler's and resolves from cache rather than a source build; the
+            # patch is purely additive (adds one hook) so the other packages build
+            # against it unchanged. Downstream repos build spider against euler's
+            # own patched GHC + cache, so this choice only governs spider's
+            # standalone build.
+            basePackages = pkgs.haskell.packages.ghc98-desugar-plugin;
 
             packages = {
               streamly-core.source = inputs.streamly + /core;

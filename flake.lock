@@ -132,17 +132,17 @@
     "record-dot-preprocessor": {
       "flake": false,
       "locked": {
-        "lastModified": 1778110972,
-        "narHash": "sha256-MymSbgH4+kaNFzDGC4kH6t7bbz1rdk4wP7RmnW4ptsE=",
-        "owner": "infinitumkiran",
+        "lastModified": 1783691947,
+        "narHash": "sha256-o+gypL6omyqKPeO8kQoDlqpKfdivbExDHo8ZiFi9+lQ=",
+        "owner": "AyushChaturvedi-7",
         "repo": "record-dot-preprocessor",
-        "rev": "98301c5c5f88f083e3e544d3ab246905c4996311",
+        "rev": "2b126423423fba113547f3a01bc66ef0cf38b263",
         "type": "github"
       },
       "original": {
-        "owner": "infinitumkiran",
+        "owner": "AyushChaturvedi-7",
         "repo": "record-dot-preprocessor",
-        "rev": "98301c5c5f88f083e3e544d3ab246905c4996311",
+        "rev": "2b126423423fba113547f3a01bc66ef0cf38b263",
         "type": "github"
       }
     },
